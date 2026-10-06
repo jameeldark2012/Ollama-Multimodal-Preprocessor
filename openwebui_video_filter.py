@@ -1,13 +1,16 @@
 """
 title: Video Frames for Ollama Vision
-version: 1.0.0
+version: 1.1.0
 required_open_webui_version: 0.6.0
 requirements: httpx
 """
 
 from __future__ import annotations
 
+import base64
+import importlib
 import math
+from collections import Counter
 from pathlib import PurePath
 from typing import Any
 from urllib.parse import quote
@@ -112,6 +115,252 @@ class Filter:
             )
         return budget
 
+    @staticmethod
+    def _remove_processed_files(body: dict[str, Any], processed_ids: set[str]) -> None:
+        if not processed_ids:
+            return
+
+        metadata = body.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("files"), list):
+            metadata["files"] = [
+                item for item in metadata["files"]
+                if not (isinstance(item, dict) and item.get("id") in processed_ids)
+            ]
+        if isinstance(body.get("files"), list):
+            body["files"] = [
+                item for item in body["files"]
+                if not (isinstance(item, dict) and item.get("id") in processed_ids)
+            ]
+        messages = body.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict) or not isinstance(message.get("files"), list):
+                    continue
+                message["files"] = [
+                    item for item in message["files"]
+                    if not (isinstance(item, dict) and item.get("id") in processed_ids)
+                ]
+
+    async def _find_persisted_video_frames(
+        self,
+        chat_id: str,
+        video_file_id: str,
+        user_id: str,
+        current_message_id: str,
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        chats = importlib.import_module("open_webui.models.chats").Chats
+        if not await chats.get_chat_by_id_and_user_id(chat_id, user_id):
+            return None
+
+        messages_map = await chats.get_messages_map_by_chat_id(chat_id) or {}
+        get_message_list = importlib.import_module("open_webui.utils.misc").get_message_list
+        active_messages = get_message_list(messages_map, current_message_id)
+        for message in active_messages:
+            message_id = message.get("id")
+            if message.get("role") != "user":
+                continue
+            frame_files = [
+                file
+                for file in message.get("files", [])
+                if isinstance(file, dict)
+                and file.get("video_frame_source_id") == video_file_id
+            ]
+            if frame_files:
+                return message_id, frame_files
+        return None
+
+    async def _request_user_message_index(
+        self,
+        chat_id: str,
+        user_id: str,
+        current_message_id: str,
+    ) -> int | None:
+        chats = importlib.import_module("open_webui.models.chats").Chats
+        if not await chats.get_chat_by_id_and_user_id(chat_id, user_id):
+            return None
+
+        messages_map = await chats.get_messages_map_by_chat_id(chat_id) or {}
+        get_message_list = importlib.import_module("open_webui.utils.misc").get_message_list
+        user_messages = [
+            message
+            for message in get_message_list(messages_map, current_message_id)
+            if message.get("role") == "user"
+        ]
+        return next(
+            (index for index, message in enumerate(user_messages) if message.get("id") == current_message_id),
+            None,
+        )
+
+    async def _restore_persisted_video_frames(
+        self,
+        request: Any,
+        chat_id: str,
+        user_id: str,
+        current_message_id: str,
+        messages: list[dict[str, Any]],
+        source_message_id: str,
+        filename: str,
+        frame_files: list[dict[str, Any]],
+    ) -> int:
+        user_message_index = await self._request_user_message_index(
+            chat_id,
+            user_id,
+            source_message_id,
+        )
+        user_messages = [message for message in messages if message.get("role") == "user"]
+        if user_message_index is None or user_message_index >= len(user_messages):
+            raise RuntimeError("Could not restore saved video frames to their original user message.")
+        target_message = user_messages[user_message_index]
+
+        content = target_message.get("content", "")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}] if content else []
+        elif isinstance(content, list):
+            content = list(content)
+        elif content is None:
+            content = []
+        else:
+            content = [{"type": "text", "text": str(content)}]
+
+        restored_count = 0
+        existing_image_urls = Counter()
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") not in {"image_url", "input_image"}:
+                continue
+            image_payload = part.get("image_url")
+            existing_url = image_payload.get("url") if isinstance(image_payload, dict) else image_payload
+            if isinstance(existing_url, str) and existing_url.startswith("data:image/"):
+                existing_image_urls[existing_url] += 1
+
+        for frame_file in frame_files:
+            frame_file_id = frame_file.get("id")
+            if not isinstance(frame_file_id, str) or not frame_file_id:
+                raise RuntimeError("A saved video frame is missing its Open WebUI file ID.")
+            image_bytes = await self._read_openwebui_file(request, frame_file_id)
+            mime_type = str(frame_file.get("content_type") or "image/jpeg")
+            image_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+            stored_url = frame_file.get("url")
+
+            if existing_image_urls[image_url]:
+                existing_image_urls[image_url] -= 1
+                continue
+
+            stored_part = next(
+                (
+                    part
+                    for part in content
+                    if isinstance(part, dict)
+                    and part.get("type") in {"image_url", "input_image"}
+                    and (
+                        (part.get("image_url", {}).get("url") if isinstance(part.get("image_url"), dict)
+                         else part.get("image_url"))
+                        == stored_url
+                    )
+                ),
+                None,
+            ) if stored_url else None
+            if stored_part is not None:
+                image_payload = stored_part.get("image_url")
+                if isinstance(image_payload, dict):
+                    stored_part["image_url"] = {**image_payload, "url": image_url}
+                else:
+                    stored_part["image_url"] = image_url
+                continue
+
+            frame_index = frame_file.get("video_frame_index", restored_count + 1)
+            timestamp = float(frame_file.get("video_frame_timestamp", 0.0))
+            content.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": f"Video frame {frame_index} from {filename} at {timestamp:.2f}s:",
+                    },
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]
+            )
+            restored_count += 1
+
+        target_message["content"] = content
+        return restored_count
+
+    async def _persist_video_frames(
+        self,
+        request: Any,
+        user_data: dict[str, Any],
+        chat_id: str,
+        message_id: str,
+        video_file_id: str,
+        filename: str,
+        frames: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        chats = importlib.import_module("open_webui.models.chats").Chats
+        users = importlib.import_module("open_webui.models.users").Users
+        upload_image = importlib.import_module("open_webui.routers.images").upload_image
+
+        user_id = user_data.get("id")
+        user = await users.get_user_by_id(user_id) if user_id else None
+        if user is None or not await chats.get_chat_by_id_and_user_id(chat_id, user_id):
+            raise RuntimeError("Could not verify chat ownership to save sampled video frames.")
+
+        message = await chats.get_message_by_id_and_message_id(chat_id, message_id)
+        if not message or message.get("role") != "user":
+            raise RuntimeError("Could not find the user message that owns the attached video.")
+
+        existing_files = message.get("files") or []
+        if any(
+            isinstance(file, dict) and file.get("video_frame_source_id") == video_file_id
+            for file in existing_files
+        ):
+            return [
+                file
+                for file in existing_files
+                if isinstance(file, dict) and file.get("video_frame_source_id") == video_file_id
+            ]
+
+        persisted_files = []
+        for frame_index, frame in enumerate(frames, start=1):
+            mime_type = str(frame.get("mime_type") or "image/jpeg")
+            encoded_data = frame.get("data")
+            if not isinstance(encoded_data, str) or not encoded_data:
+                raise RuntimeError("The frame service returned an invalid image frame.")
+            try:
+                image_bytes = base64.b64decode(encoded_data, validate=True)
+            except ValueError as exc:
+                raise RuntimeError("The frame service returned invalid base64 image data.") from exc
+
+            timestamp = float(frame.get("timestamp_seconds", 0.0))
+            _, image_file = await upload_image(
+                request,
+                image_bytes,
+                mime_type,
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "video_frame_source_id": video_file_id,
+                    "video_frame_index": frame_index,
+                    "video_frame_timestamp": timestamp,
+                },
+                user,
+            )
+            persisted_files.append(
+                {
+                    **image_file,
+                    "type": "image",
+                    "name": f"{filename} frame {frame_index:02d} at {timestamp:.2f}s",
+                    "video_frame_source_id": video_file_id,
+                    "video_frame_index": frame_index,
+                    "video_frame_timestamp": timestamp,
+                }
+            )
+
+        await chats.upsert_message_to_chat_by_id_and_message_id(
+            chat_id,
+            message_id,
+            {"files": [*existing_files, *persisted_files]},
+            touch=False,
+        )
+        return persisted_files
+
     async def _read_openwebui_file(self, request: Any, file_id: str) -> bytes:
         if request is None:
             raise RuntimeError("Open WebUI request context is unavailable; cannot read the attached video.")
@@ -180,11 +429,21 @@ class Filter:
         __request__=None,
         __user__: dict | None = None,
         __event_emitter__=None,
+        __metadata__: dict | None = None,
     ) -> dict[str, Any]:
         files = []
         existing_image_ids = set()
+        processed_ids = set()
+        persisted_frames_to_restore = []
         seen_ids = set()
         metadata = body.get("metadata")
+        request_metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+        chat_id_value = request_metadata.get("chat_id")
+        chat_id_value = chat_id_value or (metadata.get("chat_id") if isinstance(metadata, dict) else None)
+        chat_id_value = chat_id_value or body.get("chat_id")
+        chat_id = str(chat_id_value) if chat_id_value is not None else None
+        user_message_id = request_metadata.get("user_message_id")
+        user_id = __user__.get("id") if isinstance(__user__, dict) else None
         metadata_files = metadata.get("files", []) if isinstance(metadata, dict) else []
         for collection in (metadata_files, body.get("files", [])):
             if not isinstance(collection, list):
@@ -192,26 +451,101 @@ class Filter:
             for item in collection:
                 if not isinstance(item, dict) or not self._is_video_file(item):
                     if isinstance(item, dict):
-                        metadata = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+                        item_metadata = item.get("meta") if isinstance(item.get("meta"), dict) else {}
                         content_type = str(
-                            item.get("content_type") or item.get("mime_type") or metadata.get("content_type") or ""
+                            item.get("content_type")
+                            or item.get("mime_type")
+                            or item_metadata.get("content_type")
+                            or ""
                         ).lower()
                         image_id = item.get("id")
                         if content_type.startswith("image/") and isinstance(image_id, str):
                             existing_image_ids.add(image_id)
                     continue
                 file_id = self._file_id(item)
-                if file_id and file_id not in seen_ids:
-                    seen_ids.add(file_id)
-                    files.append((item, file_id))
+                if not file_id or file_id in seen_ids:
+                    continue
+                seen_ids.add(file_id)
+                if chat_id and user_id:
+                    current_message_id = str(user_message_id) if user_message_id else ""
+                    persisted = (
+                        await self._find_persisted_video_frames(
+                            chat_id,
+                            file_id,
+                            user_id,
+                            current_message_id,
+                        )
+                        if current_message_id
+                        else None
+                    )
+                else:
+                    persisted = None
+                if persisted:
+                    processed_ids.add(file_id)
+                    persisted_frames_to_restore.append(
+                        (item, persisted[0], persisted[1])
+                    )
+                    continue
+                files.append((item, file_id))
+
+        messages = body.get("messages") or []
+        restored_frame_count = 0
+        for item, source_message_id, frame_files in persisted_frames_to_restore:
+            if not chat_id or not user_id or not user_message_id:
+                raise RuntimeError("Chat identity is required to restore persisted video frames.")
+            restored_frame_count += await self._restore_persisted_video_frames(
+                __request__,
+                chat_id,
+                user_id,
+                str(user_message_id),
+                messages,
+                source_message_id,
+                str(item.get("name") or item.get("filename") or "video.mp4"),
+                frame_files,
+            )
 
         if not files:
+            self._remove_processed_files(body, processed_ids)
+            if restored_frame_count and __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Restored {restored_frame_count} saved video frames to their original message",
+                            "done": True,
+                        },
+                    }
+                )
             return body
         if len(files) > self.valves.max_videos_per_message:
             raise ValueError(f"Attach no more than {self.valves.max_videos_per_message} videos per message.")
 
-        messages = body.get("messages") or []
-        target_message = next((message for message in reversed(messages) if message.get("role") == "user"), None)
+        target_message = next(
+            (
+                message
+                for message in messages
+                if message.get("role") == "user"
+                and user_message_id
+                and message.get("id") == user_message_id
+            ),
+            None,
+        )
+        if target_message is None and chat_id and user_id and user_message_id:
+            user_messages = [message for message in messages if message.get("role") == "user"]
+            user_message_index = await self._request_user_message_index(
+                chat_id,
+                user_id,
+                str(user_message_id),
+            )
+            if user_message_index is not None and user_message_index < len(user_messages):
+                target_message = user_messages[user_message_index]
+            else:
+                raise RuntimeError("Could not map the saved user message to the model request history.")
+        if target_message is None:
+            target_message = next(
+                (message for message in reversed(messages) if message.get("role") == "user"),
+                None,
+            )
         if target_message is None:
             raise ValueError("Could not find the user message associated with the attached video.")
 
@@ -223,8 +557,6 @@ class Filter:
                 "text": "The following are timestamped frames sampled evenly across the attached video in chronological order.",
             }
         ]
-        processed_ids = set()
-
         for video_index, (item, file_id) in enumerate(files):
             frame_limit = base_budget + (1 if video_index < remainder else 0)
             filename = str(item.get("name") or item.get("filename") or "video.mp4")
@@ -234,6 +566,18 @@ class Filter:
                 )
             video_bytes = await self._read_openwebui_file(__request__, file_id)
             frames = await self._sample_frames(video_bytes, filename, frame_limit)
+            if chat_id and user_message_id:
+                if not isinstance(__user__, dict):
+                    raise RuntimeError("Open WebUI user context is required to save sampled video frames.")
+                await self._persist_video_frames(
+                    __request__,
+                    __user__,
+                    chat_id,
+                    user_message_id,
+                    file_id,
+                    filename,
+                    frames,
+                )
             for frame_index, frame in enumerate(frames, start=1):
                 mime_type = frame.get("mime_type") or "image/jpeg"
                 timestamp = float(frame.get("timestamp_seconds", 0.0))
@@ -264,23 +608,7 @@ class Filter:
         content.extend(image_parts)
         target_message["content"] = content
 
-        metadata = body.get("metadata")
-        if isinstance(metadata, dict) and isinstance(metadata.get("files"), list):
-            metadata["files"] = [
-                item for item in metadata["files"]
-                if not (isinstance(item, dict) and item.get("id") in processed_ids)
-            ]
-        if isinstance(body.get("files"), list):
-            body["files"] = [
-                item for item in body["files"]
-                if not (isinstance(item, dict) and item.get("id") in processed_ids)
-            ]
-        for message in messages:
-            if isinstance(message.get("files"), list):
-                message["files"] = [
-                    item for item in message["files"]
-                    if not (isinstance(item, dict) and item.get("id") in processed_ids)
-                ]
+        self._remove_processed_files(body, processed_ids)
 
         if __event_emitter__:
             await __event_emitter__(
