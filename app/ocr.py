@@ -57,7 +57,7 @@ async def _ask_llamacpp(client: httpx.AsyncClient, image_bytes: bytes) -> str:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Transcribe the text in this image."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                     ],
                 },
             ],
@@ -69,8 +69,17 @@ async def _ask_llamacpp(client: httpx.AsyncClient, image_bytes: bytes) -> str:
     return response.json()["choices"][0]["message"]["content"].strip()
 
 
+def _to_jpeg(image_bytes: bytes, quality: int = 85) -> bytes:
+    """Re-encode image bytes as JPEG. Handles PNG pixmaps and arbitrary image formats."""
+    with Image.open(BytesIO(image_bytes)) as img:
+        img = img.convert("RGB")
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        return buf.getvalue()
+
+
 async def _ask_model(client: httpx.AsyncClient, image_bytes: bytes) -> str:
-    """Route the request to the configured backend."""
+    """Route the request to the configured backend. Assumes image_bytes is JPEG."""
     if settings.backend == "llamacpp":
         return await _ask_llamacpp(client, image_bytes)
     return await _ask_ollama(client, image_bytes)
@@ -82,12 +91,13 @@ async def _transcribe_image(client: httpx.AsyncClient, image_bytes: bytes) -> st
             image.verify()
         with Image.open(BytesIO(image_bytes)) as image:
             image = image.convert("RGB")
-            normalized = BytesIO()
-            image.save(normalized, format="PNG")
+            buf = BytesIO()
+            image.save(buf, format="JPEG", quality=85, optimize=True)
+            jpeg_bytes = buf.getvalue()
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise ValueError("The uploaded file is not a valid, safe-to-process image.") from exc
 
-    return await _ask_model(client, normalized.getvalue())
+    return await _ask_model(client, jpeg_bytes)
 
 
 async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | None]:
@@ -131,7 +141,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                     page_started_at = perf_counter()
                     render_started_at = perf_counter()
                     pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                    page_image = pixmap.tobytes("png")
+                    page_image = pixmap.tobytes("jpeg", jpg_quality=85)
                     render_duration = perf_counter() - render_started_at
                     if settings.ocr_debug:
                         logger.info(

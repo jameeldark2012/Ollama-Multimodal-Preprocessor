@@ -18,7 +18,7 @@ class Settings:
     llamacpp_model: str = os.getenv("LLAMACPP_MODEL", "Qwen3.5-35B-A3B-Tier15-s.gguf")
 
     public_model_name: str = os.getenv("PUBLIC_MODEL_NAME", "ollama-ocr")
-    ollama_timeout_seconds: float = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "100000"))
+    ollama_timeout_seconds: float = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "900"))
     ollama_num_predict: int = int(os.getenv("OLLAMA_NUM_PREDICT", "8192"))
     ocr_debug: bool = os.getenv("OCR_DEBUG", "true").strip().lower() in {"1", "true", "yes", "on"}
     max_upload_mb: int = int(os.getenv("MAX_UPLOAD_MB", "400"))

@@ -157,6 +157,21 @@ async def process_document(
     }
 
 
+def _extract_b64_from_data_url(url: str) -> tuple[str, str]:
+    """Return (mime_type, base64_string) from a data URL without decoding the image bytes."""
+    try:
+        header, b64 = url.split(",", 1)
+        if not header.startswith("data:") or ";base64" not in header:
+            raise ValueError
+        mime = header[len("data:"):header.index(";")]
+        # Validate it is actually base64 without allocating the full decoded bytes
+        import binascii
+        binascii.a2b_base64(b64[:64] + "====")  # quick sanity check on first bytes only
+        return mime, b64
+    except (ValueError, Exception) as exc:
+        raise ValueError("Images must be supplied as base64 data URLs.") from exc
+
+
 async def _chat_completion(request: ChatRequest) -> tuple[str, str]:
     messages = []
     for message in request.messages:
@@ -164,7 +179,8 @@ async def _chat_completion(request: ChatRequest) -> tuple[str, str]:
         if role not in {"system", "user", "assistant"}:
             continue
         content = message.get("content", "")
-        images: list[str] = []
+        # image_entries stores (mime_type, base64_string) — never decoded to raw bytes
+        image_entries: list[tuple[str, str]] = []
         if isinstance(content, list):
             text_parts = []
             for part in content:
@@ -175,13 +191,14 @@ async def _chat_completion(request: ChatRequest) -> tuple[str, str]:
                 elif part.get("type") == "image_url":
                     image_url = part.get("image_url", {}).get("url", "")
                     try:
-                        images.append(image_from_data_url(image_url))
+                        mime, b64 = _extract_b64_from_data_url(image_url)
                     except ValueError as exc:
                         raise HTTPException(status_code=400, detail=str(exc)) from exc
+                    image_entries.append((mime, b64))
             content = "\n".join(text_parts)
         converted: dict[str, Any] = {"role": role, "content": str(content)}
-        if images:
-            converted["images"] = images
+        if image_entries:
+            converted["image_entries"] = image_entries
         messages.append(converted)
 
     if not messages:
@@ -190,13 +207,14 @@ async def _chat_completion(request: ChatRequest) -> tuple[str, str]:
     try:
         async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
             if settings.backend == "llamacpp":
-                # Convert any Ollama-style base64 image lists to OpenAI-style content arrays
+                # Build OpenAI-style content arrays, passing base64 strings directly
                 openai_messages = []
                 for msg in messages:
-                    if msg.get("images"):
+                    entries = msg.get("image_entries")
+                    if entries:
                         parts: list[Any] = [{"type": "text", "text": msg["content"]}]
-                        for img_b64 in msg["images"]:
-                            parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}})
+                        for mime, b64 in entries:
+                            parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
                         openai_messages.append({"role": msg["role"], "content": parts})
                     else:
                         openai_messages.append({"role": msg["role"], "content": msg["content"]})
@@ -212,11 +230,24 @@ async def _chat_completion(request: ChatRequest) -> tuple[str, str]:
                 response.raise_for_status()
                 reply = response.json()["choices"][0]["message"]["content"]
             else:
+                # Convert image_entries tuples to plain base64 strings for Ollama's /api/chat format
+                ollama_messages = []
+                for msg in messages:
+                    entries = msg.get("image_entries")
+                    if entries:
+                        ollama_msg: dict[str, Any] = {
+                            "role": msg["role"],
+                            "content": msg["content"],
+                            "images": [b64 for _mime, b64 in entries],
+                        }
+                        ollama_messages.append(ollama_msg)
+                    else:
+                        ollama_messages.append({"role": msg["role"], "content": msg["content"]})
                 response = await client.post(
                     f"{settings.ollama_base_url}/api/chat",
                     json={
                         "model": settings.ollama_model,
-                        "messages": messages,
+                        "messages": ollama_messages,
                         "stream": False,
                         "think": False,
                         "options": {"temperature": 0, "num_predict": settings.ollama_num_predict},
