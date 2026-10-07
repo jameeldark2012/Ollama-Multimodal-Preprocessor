@@ -31,11 +31,17 @@ class ChatRequest(BaseModel):
 async def health() -> dict[str, str]:
     try:
         async with httpx.AsyncClient(timeout=3) as client:
-            response = await client.get(f"{settings.ollama_base_url}/api/version")
-            response.raise_for_status()
+            if settings.backend == "llamacpp":
+                response = await client.get(f"{settings.llamacpp_base_url}/health")
+                response.raise_for_status()
+                return {"status": "ok", "backend": "llamacpp", "model": settings.llamacpp_model}
+            else:
+                response = await client.get(f"{settings.ollama_base_url}/api/version")
+                response.raise_for_status()
+                return {"status": "ok", "backend": "ollama", "ollama_version": response.json().get("version", "unknown")}
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Ollama is unavailable.") from exc
-    return {"status": "ok", "ollama_version": response.json().get("version", "unknown")}
+        backend_label = "llama.cpp" if settings.backend == "llamacpp" else "Ollama"
+        raise HTTPException(status_code=503, detail=f"{backend_label} is unavailable.") from exc
 
 
 @app.get("/v1/models")
@@ -112,10 +118,12 @@ async def ocr_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc
     except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="Ollama timed out while processing the file.") from exc
+        backend_label = "llama.cpp" if settings.backend == "llamacpp" else "Ollama"
+        raise HTTPException(status_code=504, detail=f"{backend_label} timed out while processing the file.") from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Ollama failed to process the file.") from exc
-    return {"filename": filename, "model": settings.ollama_model, "pages_processed": pages, "text": text}
+        backend_label = "llama.cpp" if settings.backend == "llamacpp" else "Ollama"
+        raise HTTPException(status_code=502, detail=f"{backend_label} failed to process the file.") from exc
+    return {"filename": filename, "model": settings.active_model, "pages_processed": pages, "text": text}
 
 
 @app.put("/process")
@@ -132,9 +140,11 @@ async def process_document(
     except ValueError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc
     except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="Ollama timed out while processing the file.") from exc
+        backend_label = "llama.cpp" if settings.backend == "llamacpp" else "Ollama"
+        raise HTTPException(status_code=504, detail=f"{backend_label} timed out while processing the file.") from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Ollama failed to process the file.") from exc
+        backend_label = "llama.cpp" if settings.backend == "llamacpp" else "Ollama"
+        raise HTTPException(status_code=502, detail=f"{backend_label} failed to process the file.") from exc
 
     return {
         "page_content": text,
@@ -179,22 +189,48 @@ async def _chat_completion(request: ChatRequest) -> tuple[str, str]:
 
     try:
         async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
-            response = await client.post(
-                f"{settings.ollama_base_url}/api/chat",
-                json={
-                    "model": settings.ollama_model,
-                    "messages": messages,
-                    "stream": False,
-                    "think": False,
-                    "options": {"temperature": 0, "num_predict": settings.ollama_num_predict},
-                },
-            )
-            response.raise_for_status()
+            if settings.backend == "llamacpp":
+                # Convert any Ollama-style base64 image lists to OpenAI-style content arrays
+                openai_messages = []
+                for msg in messages:
+                    if msg.get("images"):
+                        parts: list[Any] = [{"type": "text", "text": msg["content"]}]
+                        for img_b64 in msg["images"]:
+                            parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}})
+                        openai_messages.append({"role": msg["role"], "content": parts})
+                    else:
+                        openai_messages.append({"role": msg["role"], "content": msg["content"]})
+                response = await client.post(
+                    f"{settings.llamacpp_base_url}/chat/completions",
+                    json={
+                        "model": settings.llamacpp_model,
+                        "messages": openai_messages,
+                        "temperature": 0,
+                        "max_tokens": settings.ollama_num_predict,
+                    },
+                )
+                response.raise_for_status()
+                reply = response.json()["choices"][0]["message"]["content"]
+            else:
+                response = await client.post(
+                    f"{settings.ollama_base_url}/api/chat",
+                    json={
+                        "model": settings.ollama_model,
+                        "messages": messages,
+                        "stream": False,
+                        "think": False,
+                        "options": {"temperature": 0, "num_predict": settings.ollama_num_predict},
+                    },
+                )
+                response.raise_for_status()
+                reply = response.json()["message"]["content"]
     except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="Ollama timed out while generating a response.") from exc
+        backend_label = "llama.cpp" if settings.backend == "llamacpp" else "Ollama"
+        raise HTTPException(status_code=504, detail=f"{backend_label} timed out while generating a response.") from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Ollama failed to generate a response.") from exc
-    return response.json()["message"]["content"], str(uuid.uuid4())
+        backend_label = "llama.cpp" if settings.backend == "llamacpp" else "Ollama"
+        raise HTTPException(status_code=502, detail=f"{backend_label} failed to generate a response.") from exc
+    return reply, str(uuid.uuid4())
 
 
 @app.post("/v1/chat/completions")

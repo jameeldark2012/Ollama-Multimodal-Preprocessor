@@ -13,7 +13,44 @@ python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+The backend defaults to Ollama. Set `BACKEND=llamacpp` in `.env` to use a llama.cpp server instead (see **Backends** below).
+
+## Backends
+
+### Ollama (default)
+
 Ollama must be running and have the configured vision model installed. Defaults use `fredrezones55/Qwen3.5-APEX:latest` at `http://127.0.0.1:11434`. The output token limit defaults to 8,192 (`OLLAMA_NUM_PREDICT`), and the request timeout defaults to 900 seconds (`OLLAMA_TIMEOUT_SECONDS`).
+
+Relevant `.env` settings:
+
+```env
+BACKEND=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=fredrezones55/Qwen3.5-APEX:latest
+```
+
+### llama.cpp server
+
+Start `llama-server` with a vision-capable model and point this backend at it. The llama.cpp server must expose an OpenAI-compatible `/v1` endpoint (the default when you start it with `--port 8081`).
+
+Relevant `.env` settings:
+
+```env
+BACKEND=llamacpp
+LLAMACPP_BASE_URL=http://127.0.0.1:8081/v1
+LLAMACPP_MODEL=Qwen3.5-35B-A3B-Tier15-s.gguf
+```
+
+`LLAMACPP_MODEL` must match the model name the server reports — for a local GGUF file it is usually just the filename. `OLLAMA_NUM_PREDICT` and `OLLAMA_TIMEOUT_SECONDS` are reused as the token limit and request timeout for llama.cpp calls as well.
+
+Example `llama-server` launch (adjust paths and GPU layers as needed):
+
+```powershell
+llama-server.exe `
+  --model "E:\Models\Qwen3.5-35B-A3B-Tier15-s.gguf" `
+  --host 127.0.0.1 --port 8081 `
+  --n-gpu-layers 99 --ctx-size 32768
+```
 
 Set `OCR_DEBUG=true` in `.env` and restart the backend to log the processing stages, PDF render time, per-page model and total time, and overall request duration. Set it to `false` (or remove it) to disable these logs.
 

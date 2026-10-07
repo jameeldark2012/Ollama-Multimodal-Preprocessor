@@ -44,6 +44,38 @@ async def _ask_ollama(client: httpx.AsyncClient, image_bytes: bytes) -> str:
     return response.json()["message"]["content"].strip()
 
 
+async def _ask_llamacpp(client: httpx.AsyncClient, image_bytes: bytes) -> str:
+    """Send an image to a llama.cpp server via its OpenAI-compatible /v1/chat/completions endpoint."""
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    response = await client.post(
+        f"{settings.llamacpp_base_url}/chat/completions",
+        json={
+            "model": settings.llamacpp_model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Transcribe the text in this image."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    ],
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": settings.ollama_num_predict,
+        },
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+
+async def _ask_model(client: httpx.AsyncClient, image_bytes: bytes) -> str:
+    """Route the request to the configured backend."""
+    if settings.backend == "llamacpp":
+        return await _ask_llamacpp(client, image_bytes)
+    return await _ask_ollama(client, image_bytes)
+
+
 async def _transcribe_image(client: httpx.AsyncClient, image_bytes: bytes) -> str:
     try:
         with Image.open(BytesIO(image_bytes)) as image:
@@ -55,7 +87,7 @@ async def _transcribe_image(client: httpx.AsyncClient, image_bytes: bytes) -> st
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise ValueError("The uploaded file is not a valid, safe-to-process image.") from exc
 
-    return await _ask_ollama(client, normalized.getvalue())
+    return await _ask_model(client, normalized.getvalue())
 
 
 async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | None]:
@@ -63,7 +95,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
     started_at = perf_counter()
     suffix = PurePath(filename).suffix.lower()
     if settings.ocr_debug:
-        logger.info("OCR started: file=%s type=%s bytes=%d model=%s", filename, suffix, len(data), settings.ollama_model)
+        logger.info("OCR started: file=%s type=%s bytes=%d model=%s", filename, suffix, len(data), settings.active_model)
 
     if suffix in TEXT_EXTENSIONS:
         decode_started_at = perf_counter()
@@ -111,7 +143,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                             len(page_image),
                         )
                     inference_started_at = perf_counter()
-                    page_text = await _ask_ollama(client, page_image)
+                    page_text = await _ask_model(client, page_image)
                     inference_duration = perf_counter() - inference_started_at
                     pages.append(page_text)
                     if settings.ocr_debug:
