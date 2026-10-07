@@ -13,7 +13,7 @@ class Settings:
     public_model_name: str = os.getenv("PUBLIC_MODEL_NAME", "ollama-ocr")
     ollama_timeout_seconds: float = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "100000"))
     ollama_num_predict: int = int(os.getenv("OLLAMA_NUM_PREDICT", "8192"))
-    ocr_debug: bool = os.getenv("OCR_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
+    ocr_debug: bool = os.getenv("OCR_DEBUG", "true").strip().lower() in {"1", "true", "yes", "on"}
     max_upload_mb: int = int(os.getenv("MAX_UPLOAD_MB", "400"))
     max_pdf_pages: int = int(os.getenv("MAX_PDF_PAGES", "10000"))
     video_max_upload_mb: int = int(os.getenv("VIDEO_MAX_UPLOAD_MB", "5000"))
