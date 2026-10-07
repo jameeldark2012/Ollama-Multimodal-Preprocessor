@@ -78,14 +78,15 @@ def _to_jpeg(image_bytes: bytes, quality: int = 85) -> bytes:
         return buf.getvalue()
 
 
-async def _ask_model(client: httpx.AsyncClient, image_bytes: bytes) -> str:
-    """Route the request to the configured backend. Assumes image_bytes is JPEG."""
-    if settings.backend == "llamacpp":
-        return await _ask_llamacpp(client, image_bytes)
-    return await _ask_ollama(client, image_bytes)
+async def _ask_model(image_bytes: bytes, timeout_seconds: float) -> str:
+    """Route the request to the configured backend. Assumes image_bytes is JPEG. Creates its own client."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+        if settings.backend == "llamacpp":
+            return await _ask_llamacpp(client, image_bytes)
+        return await _ask_ollama(client, image_bytes)
 
 
-async def _transcribe_image(client: httpx.AsyncClient, image_bytes: bytes) -> str:
+async def _transcribe_image(image_bytes: bytes, timeout_seconds: float) -> str:
     try:
         with Image.open(BytesIO(image_bytes)) as image:
             image.verify()
@@ -97,7 +98,7 @@ async def _transcribe_image(client: httpx.AsyncClient, image_bytes: bytes) -> st
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise ValueError("The uploaded file is not a valid, safe-to-process image.") from exc
 
-    return await _ask_model(client, jpeg_bytes)
+    return await _ask_model(jpeg_bytes, timeout_seconds)
 
 
 async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | None]:
@@ -118,73 +119,73 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
             logger.info("OCR finished: file=%s chars=%d total=%.2fs", filename, len(text), perf_counter() - started_at)
         return text, None
 
-    timeout = httpx.Timeout(settings.ollama_timeout_seconds)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if suffix == ".pdf":
-            try:
-                document = fitz.open(stream=data, filetype="pdf")
-            except (fitz.FileDataError, ValueError) as exc:
-                raise ValueError("The uploaded file is not a valid PDF.") from exc
+    if suffix == ".pdf":
+        try:
+            document = fitz.open(stream=data, filetype="pdf")
+        except (fitz.FileDataError, ValueError) as exc:
+            raise ValueError("The uploaded file is not a valid PDF.") from exc
 
-            with document:
-                if document.needs_pass:
-                    raise ValueError("Password-protected PDFs are not supported.")
-                if len(document) == 0:
-                    raise ValueError("The PDF has no pages.")
-                if len(document) > settings.max_pdf_pages:
-                    raise ValueError(f"PDF exceeds the {settings.max_pdf_pages}-page limit.")
+        with document:
+            if document.needs_pass:
+                raise ValueError("Password-protected PDFs are not supported.")
+            if len(document) == 0:
+                raise ValueError("The PDF has no pages.")
+            if len(document) > settings.max_pdf_pages:
+                raise ValueError(f"PDF exceeds the {settings.max_pdf_pages}-page limit.")
 
-                if settings.ocr_debug:
-                    logger.info("PDF opened: file=%s pages=%d", filename, len(document))
-                pages = []
-                for page_number, page in enumerate(document, start=1):
-                    page_started_at = perf_counter()
-                    render_started_at = perf_counter()
-                    pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                    page_image = pixmap.tobytes("jpeg", jpg_quality=85)
-                    render_duration = perf_counter() - render_started_at
-                    if settings.ocr_debug:
-                        logger.info(
-                            "PDF page rendered: file=%s page=%d/%d duration=%.2fs image_bytes=%d",
-                            filename,
-                            page_number,
-                            len(document),
-                            render_duration,
-                            len(page_image),
-                        )
-                    inference_started_at = perf_counter()
-                    page_text = await _ask_model(client, page_image)
-                    inference_duration = perf_counter() - inference_started_at
-                    pages.append(page_text)
-                    if settings.ocr_debug:
-                        logger.info(
-                            "PDF page completed: file=%s page=%d/%d model=%.2fs page_total=%.2fs chars=%d",
-                            filename,
-                            page_number,
-                            len(document),
-                            inference_duration,
-                            perf_counter() - page_started_at,
-                            len(page_text),
-                        )
-                text = "\n\n".join(pages).strip()
+            if settings.ocr_debug:
+                logger.info("PDF opened: file=%s pages=%d", filename, len(document))
+            pages = []
+            for page_number, page in enumerate(document, start=1):
+                page_started_at = perf_counter()
+                render_started_at = perf_counter()
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                page_image = pixmap.tobytes("jpeg", jpg_quality=85)
+                pixmap = None  # Release C-allocated pixmap memory immediately
+                render_duration = perf_counter() - render_started_at
                 if settings.ocr_debug:
                     logger.info(
-                        "OCR finished: file=%s pages=%d chars=%d total=%.2fs",
+                        "PDF page rendered: file=%s page=%d/%d duration=%.2fs image_bytes=%d",
                         filename,
-                        len(pages),
-                        len(text),
-                        perf_counter() - started_at,
+                        page_number,
+                        len(document),
+                        render_duration,
+                        len(page_image),
                     )
-                return text, len(pages)
-
-        if suffix in IMAGE_EXTENSIONS:
-            page_started_at = perf_counter()
-            text = await _transcribe_image(client, data)
+                inference_started_at = perf_counter()
+                page_text = await _ask_model(page_image, settings.ollama_timeout_seconds)
+                page_image = None  # Release JPEG bytes immediately after sending
+                inference_duration = perf_counter() - inference_started_at
+                pages.append(page_text)
+                if settings.ocr_debug:
+                    logger.info(
+                        "PDF page completed: file=%s page=%d/%d model=%.2fs page_total=%.2fs chars=%d",
+                        filename,
+                        page_number,
+                        len(document),
+                        inference_duration,
+                        perf_counter() - page_started_at,
+                        len(page_text),
+                    )
+            text = "\n\n".join(pages).strip()
             if settings.ocr_debug:
-                duration = perf_counter() - page_started_at
-                logger.info("Image page completed: file=%s page=1/1 page_total=%.2fs chars=%d", filename, duration, len(text))
-                logger.info("OCR finished: file=%s pages=1 chars=%d total=%.2fs", filename, len(text), perf_counter() - started_at)
-            return text, 1
+                logger.info(
+                    "OCR finished: file=%s pages=%d chars=%d total=%.2fs",
+                    filename,
+                    len(pages),
+                    len(text),
+                    perf_counter() - started_at,
+                )
+            return text, len(pages)
+
+    if suffix in IMAGE_EXTENSIONS:
+        page_started_at = perf_counter()
+        text = await _transcribe_image(data, settings.ollama_timeout_seconds)
+        if settings.ocr_debug:
+            duration = perf_counter() - page_started_at
+            logger.info("Image page completed: file=%s page=1/1 page_total=%.2fs chars=%d", filename, duration, len(text))
+            logger.info("OCR finished: file=%s pages=1 chars=%d total=%.2fs", filename, len(text), perf_counter() - started_at)
+        return text, 1
 
     raise ValueError(f"Unsupported file type: {suffix or '(no extension)'}.")
 
