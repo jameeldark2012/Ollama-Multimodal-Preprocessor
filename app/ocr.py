@@ -9,10 +9,12 @@ import httpx
 from charset_normalizer import from_bytes
 from PIL import Image, UnidentifiedImageError
 
+from app.checkpoint import CheckpointManager
 from app.config import settings
 
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
+checkpoint_manager = CheckpointManager(settings.checkpoint_dir)
 TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".html", ".xml", ".yaml", ".yml"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 SYSTEM_PROMPT = (
@@ -133,10 +135,67 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
             if len(document) > settings.max_pdf_pages:
                 raise ValueError(f"PDF exceeds the {settings.max_pdf_pages}-page limit.")
 
+            total_pages = len(document)
             if settings.ocr_debug:
-                logger.info("PDF opened: file=%s pages=%d", filename, len(document))
-            pages = []
+                logger.info("PDF opened: file=%s pages=%d", filename, total_pages)
+
+            # Calculate file hash and check for existing checkpoint
+            file_hash = checkpoint_manager.calculate_file_hash(data)
+            checkpoint_info = checkpoint_manager.find_checkpoint(file_hash)
+
+            if checkpoint_info:
+                # Resume from existing checkpoint
+                completed = checkpoint_info.completed_pages
+                if checkpoint_info.status == "completed" and completed == total_pages:
+                    # Already fully processed - return cached result immediately
+                    if settings.ocr_debug:
+                        logger.info(
+                            "PDF already completed in checkpoint: file=%s hash=%s pages=%d",
+                            filename,
+                            file_hash,
+                            total_pages,
+                        )
+                    pages = checkpoint_manager.load_all_pages(checkpoint_info.checkpoint_dir, total_pages)
+                    text = "\n\n".join(pages).strip()
+                    if settings.ocr_debug:
+                        logger.info(
+                            "OCR finished (cached): file=%s pages=%d chars=%d total=%.2fs",
+                            filename,
+                            len(pages),
+                            len(text),
+                            perf_counter() - started_at,
+                        )
+                    return text, len(pages)
+                else:
+                    # Resume partial processing
+                    if settings.ocr_debug:
+                        logger.info(
+                            "Resuming from checkpoint: file=%s hash=%s completed=%d/%d",
+                            filename,
+                            file_hash,
+                            completed,
+                            total_pages,
+                        )
+                    checkpoint_dir = checkpoint_info.checkpoint_dir
+                    completed_page_numbers = checkpoint_manager.get_completed_page_numbers(checkpoint_dir)
+                    pages = checkpoint_manager.load_all_pages(checkpoint_dir, total_pages)
+            else:
+                # Create new checkpoint
+                checkpoint_dir = checkpoint_manager.create_checkpoint(file_hash, filename, total_pages)
+                completed_page_numbers = set()
+                pages = [""] * total_pages
+                if settings.ocr_debug:
+                    logger.info("Created new checkpoint: file=%s hash=%s pages=%d", filename, file_hash, total_pages)
+
+            # Process pages
+            pages_processed = 0
             for page_number, page in enumerate(document, start=1):
+                # Skip already completed pages
+                if page_number in completed_page_numbers:
+                    if settings.ocr_debug:
+                        logger.info("Skipping completed page: file=%s page=%d/%d", filename, page_number, total_pages)
+                    continue
+
                 page_started_at = perf_counter()
                 render_started_at = perf_counter()
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
@@ -148,7 +207,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                         "PDF page rendered: file=%s page=%d/%d duration=%.2fs image_bytes=%d",
                         filename,
                         page_number,
-                        len(document),
+                        total_pages,
                         render_duration,
                         len(page_image),
                     )
@@ -156,17 +215,37 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                 page_text = await _ask_model(page_image, settings.ollama_timeout_seconds)
                 page_image = None  # Release JPEG bytes immediately after sending
                 inference_duration = perf_counter() - inference_started_at
-                pages.append(page_text)
+                pages[page_number - 1] = page_text
+                pages_processed += 1
+
+                # Save page to checkpoint
+                checkpoint_manager.save_page(checkpoint_dir, page_number, page_text)
+
+                # Update progress at configured interval
+                if pages_processed % settings.checkpoint_save_interval == 0:
+                    completed_count = len(completed_page_numbers) + pages_processed
+                    checkpoint_manager.update_progress(checkpoint_dir, completed_count, total_pages, "processing")
+                    if settings.ocr_debug:
+                        logger.info(
+                            "Checkpoint saved: file=%s progress=%d/%d",
+                            filename,
+                            completed_count,
+                            total_pages,
+                        )
+
                 if settings.ocr_debug:
                     logger.info(
                         "PDF page completed: file=%s page=%d/%d model=%.2fs page_total=%.2fs chars=%d",
                         filename,
                         page_number,
-                        len(document),
+                        total_pages,
                         inference_duration,
                         perf_counter() - page_started_at,
                         len(page_text),
                     )
+
+            # Mark as completed
+            checkpoint_manager.update_progress(checkpoint_dir, total_pages, total_pages, "completed")
             text = "\n\n".join(pages).strip()
             if settings.ocr_debug:
                 logger.info(

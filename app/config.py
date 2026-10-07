@@ -31,6 +31,8 @@ class Settings:
     video_frame_max_dimension: int = int(os.getenv("VIDEO_FRAME_MAX_DIMENSION", "768"))
     video_jpeg_quality: int = int(os.getenv("VIDEO_JPEG_QUALITY", "5"))
     video_ffmpeg_timeout_seconds: float = float(os.getenv("VIDEO_FFMPEG_TIMEOUT_SECONDS", "30"))
+    checkpoint_dir: str = os.getenv("CHECKPOINT_DIR", "checkpoints")
+    checkpoint_save_interval: int = int(os.getenv("CHECKPOINT_SAVE_INTERVAL", "20"))
 
     @property
     def active_model(self) -> str:
