@@ -2,6 +2,7 @@
 Quick tests for RateLimiter (no blocking tests).
 Run these first to verify basic functionality without waiting.
 """
+import asyncio
 import time
 import pytest
 from app.rate_limiter import RateLimiter, estimate_text_tokens, estimate_image_tokens
@@ -43,32 +44,35 @@ class TestRateLimiterBasics:
         
         print(f"✓ Limiter initialized: {limiter.effective_rpm} RPM, {limiter.effective_tpm} TPM")
     
-    def test_rpm_allows_under_limit(self):
+    @pytest.mark.asyncio
+    async def test_rpm_allows_under_limit(self):
         """Should allow requests under RPM limit without blocking."""
         limiter = RateLimiter(rpm_limit=12, tpm_limit=220000, safety_margin=0.9)
         
         start = time.time()
         # Make 5 requests (under 10.8 effective limit)
         for i in range(5):
-            limiter.wait(estimated_tokens=1000)
+            await limiter.wait(estimated_tokens=1000)
         elapsed = time.time() - start
         
         assert elapsed < 0.5  # Should be instant
         print(f"✓ 5 requests completed in {elapsed:.3f}s (instant)")
     
-    def test_tpm_allows_under_limit(self):
+    @pytest.mark.asyncio
+    async def test_tpm_allows_under_limit(self):
         """Should allow tokens under TPM limit without blocking."""
         limiter = RateLimiter(rpm_limit=12, tpm_limit=220000, safety_margin=0.9)
         
         start = time.time()
         # Use 150K tokens (under 198K effective limit)
-        limiter.wait(estimated_tokens=150000)
+        await limiter.wait(estimated_tokens=150000)
         elapsed = time.time() - start
         
         assert elapsed < 0.5
         print(f"✓ 150K tokens allowed instantly (under 198K limit)")
     
-    def test_realistic_batch_scenario(self):
+    @pytest.mark.asyncio
+    async def test_realistic_batch_scenario(self):
         """Test realistic scenario: 3 batches of 20 pages."""
         limiter = RateLimiter(rpm_limit=12, tpm_limit=220000, safety_margin=0.9)
         
@@ -76,7 +80,7 @@ class TestRateLimiterBasics:
         start = time.time()
         
         for batch_num in range(3):
-            limiter.wait(estimated_tokens=60000)
+            await limiter.wait(estimated_tokens=60000)
             print(f"  Batch {batch_num + 1}: 60K tokens processed")
         
         elapsed = time.time() - start
@@ -85,15 +89,16 @@ class TestRateLimiterBasics:
         assert elapsed < 1.0
         print(f"✓ 3 batches (180K tokens) completed in {elapsed:.3f}s")
     
-    def test_detects_would_exceed_tpm(self):
+    @pytest.mark.asyncio
+    async def test_detects_would_exceed_tpm(self):
         """Verify limiter would block when TPM would be exceeded."""
         limiter = RateLimiter(rpm_limit=100, tpm_limit=10000, safety_margin=1.0)
         
         # Use 8000 tokens
-        limiter.wait(estimated_tokens=8000)
+        await limiter.wait(estimated_tokens=8000)
         
         # Check internal state
-        now = time.time()
+        now = time.monotonic()
         recent_tokens = sum(t for s, t in limiter._timestamps if now - s < 60)
         
         assert recent_tokens == 8000
@@ -102,16 +107,31 @@ class TestRateLimiterBasics:
         # Another 5000 would exceed (total 13000 > 10000)
         # We can't test the wait without blocking, but we verified tracking works
 
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_reserve_distinct_rpm_slots(self):
+        """A waiting caller must reserve its future slot before it sleeps."""
+        limiter = RateLimiter(rpm_limit=2, tpm_limit=100000, safety_margin=1.0)
+        await asyncio.gather(limiter.wait(estimated_tokens=1), limiter.wait(estimated_tokens=1))
+
+        waiting_call = asyncio.create_task(limiter.wait(estimated_tokens=1))
+        await asyncio.sleep(0)
+        assert not waiting_call.done()
+        assert len(limiter._reservations) == 3
+        waiting_call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting_call
+
 
 class TestEdgeCases:
     """Test edge cases."""
     
-    def test_zero_tokens(self):
+    @pytest.mark.asyncio
+    async def test_zero_tokens(self):
         """Zero tokens should not block."""
         limiter = RateLimiter(rpm_limit=12, tpm_limit=220000, safety_margin=0.9)
         
         start = time.time()
-        limiter.wait(estimated_tokens=0)
+        await limiter.wait(estimated_tokens=0)
         elapsed = time.time() - start
         
         assert elapsed < 0.1

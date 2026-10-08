@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import logging
 from datetime import datetime
@@ -103,6 +104,15 @@ def _to_jpeg(image_bytes: bytes, quality: int = 85) -> bytes:
         return buf.getvalue()
 
 
+def _render_pdf_page(page: fitz.Page) -> bytes:
+    """Render one page without keeping CPU-bound MuPDF work on the event loop."""
+    pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+    try:
+        return pixmap.tobytes("jpeg", jpg_quality=85)
+    finally:
+        pixmap = None
+
+
 async def _ask_model(image_bytes: bytes, timeout_seconds: float, force_local: bool = False) -> str:
     """
     Route the request to the configured backend with fallback support.
@@ -118,8 +128,8 @@ async def _ask_model(image_bytes: bytes, timeout_seconds: float, force_local: bo
     # Try Gemini first if configured AND not forcing local
     if not force_local and settings.backend == "gemini" and gemini_backend is not None:
         try:
-            results = gemini_backend.transcribe_batch([image_bytes])
-            return results[0] if results else ""
+            results = await gemini_backend.transcribe_batch([image_bytes])
+            return results[0][0] if results else ""  # Extract text from (text, reason) tuple
         except Exception as exc:
             logger.error("Gemini backend failed: %s", exc)
             if settings.gemini_fallback_to_local:
@@ -191,8 +201,8 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                 logger.info("PDF opened: file=%s pages=%d", filename, total_pages)
 
             # Calculate file hash and check for existing checkpoint
-            file_hash = checkpoint_manager.calculate_file_hash(data)
-            checkpoint_info = checkpoint_manager.find_checkpoint(file_hash)
+            file_hash = await checkpoint_manager.calculate_file_hash(data)
+            checkpoint_info = await checkpoint_manager.find_checkpoint(file_hash)
 
             if checkpoint_info:
                 # Resume from existing checkpoint
@@ -206,7 +216,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                             file_hash,
                             total_pages,
                         )
-                    pages = checkpoint_manager.load_all_pages(checkpoint_info.checkpoint_dir, total_pages)
+                    pages = await checkpoint_manager.load_all_pages(checkpoint_info.checkpoint_dir, total_pages)
                     non_empty_pages = [p for p in pages if p.strip()]
                     text = "\n\n".join(non_empty_pages).strip()
                     if settings.ocr_debug:
@@ -230,11 +240,11 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                             total_pages,
                         )
                     checkpoint_dir = checkpoint_info.checkpoint_dir
-                    completed_page_numbers = checkpoint_manager.get_completed_page_numbers(checkpoint_dir)
-                    pages = checkpoint_manager.load_all_pages(checkpoint_dir, total_pages)
+                    completed_page_numbers = await checkpoint_manager.get_completed_page_numbers(checkpoint_dir)
+                    pages = await checkpoint_manager.load_all_pages(checkpoint_dir, total_pages)
             else:
                 # Create new checkpoint
-                checkpoint_dir = checkpoint_manager.create_checkpoint(file_hash, filename, total_pages)
+                checkpoint_dir = await checkpoint_manager.create_checkpoint(file_hash, filename, total_pages)
                 completed_page_numbers = set()
                 pages = [""] * total_pages
                 if settings.ocr_debug:
@@ -243,7 +253,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
             # Process pages - batch when using Gemini, one-by-one otherwise
             pages_processed = 0
             pending_pages: list[tuple[int, bytes]] = []  # (page_number, image_bytes)
-            failed_pages_metadata: dict[int, dict] = checkpoint_manager.load_failed_pages(checkpoint_dir)
+            failed_pages_metadata: dict[int, dict] = await checkpoint_manager.load_failed_pages(checkpoint_dir)
             
             # Determine batch size
             batch_size = gemini_backend.batch_size if (settings.backend == "gemini" and gemini_backend) else 1
@@ -259,9 +269,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                         # This page needs retry - render it
                         page_started_at = perf_counter()
                         page = document[page_num - 1]
-                        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                        page_image = pixmap.tobytes("jpeg", jpg_quality=85)
-                        pixmap = None
+                        page_image = await asyncio.to_thread(_render_pdf_page, page)
                         pages_to_retry.append((page_num, page_image))
                         if settings.ocr_debug:
                             logger.info(
@@ -274,6 +282,9 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                             )
             
             for page_number, page in enumerate(document, start=1):
+                # Yield control to other requests after each page
+                await asyncio.sleep(0)
+
                 # Skip already completed pages
                 if page_number in completed_page_numbers:
                     if settings.ocr_debug:
@@ -286,9 +297,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
 
                 page_started_at = perf_counter()
                 render_started_at = perf_counter()
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                page_image = pixmap.tobytes("jpeg", jpg_quality=85)
-                pixmap = None  # Release C-allocated pixmap memory immediately
+                page_image = await asyncio.to_thread(_render_pdf_page, page)
                 render_duration = perf_counter() - render_started_at
                 if settings.ocr_debug:
                     logger.info(
@@ -311,7 +320,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                         # Batch process with Gemini
                         try:
                             images = [img for _, img in pending_pages]
-                            results = gemini_backend.transcribe_batch(images)
+                            results = await gemini_backend.transcribe_batch(images)
                             
                             # Process results with failure tracking
                             for (pnum, img), (text, reason) in zip(pending_pages, results):
@@ -319,7 +328,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                                     # Success!
                                     pages[pnum - 1] = text
                                     pages_processed += 1
-                                    checkpoint_manager.save_page(checkpoint_dir, pnum, text)
+                                    await checkpoint_manager.save_page(checkpoint_dir, pnum, text)
                                     # Remove from failed metadata if it was there
                                     if pnum in failed_pages_metadata:
                                         del failed_pages_metadata[pnum]
@@ -354,10 +363,10 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                                             reason,
                                             failed_pages_metadata[pnum]["attempts"],
                                         )
-                                        checkpoint_manager.save_page(checkpoint_dir, pnum, "")
+                                        await checkpoint_manager.save_page(checkpoint_dir, pnum, "")
                             
                             # Save failed pages metadata
-                            checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                            await checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
 
                         except Exception as exc:
                             logger.error("Gemini batch processing failed: %s", exc)
@@ -379,14 +388,14 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                                         if failed_pages_metadata[pnum]["attempts"] < 2:
                                             pages_to_retry.append((pnum, img))
                                         else:
-                                            checkpoint_manager.save_page(checkpoint_dir, pnum, "")
+                                            await checkpoint_manager.save_page(checkpoint_dir, pnum, "")
                                     else:
                                         pages[pnum - 1] = page_text
                                         pages_processed += 1
-                                        checkpoint_manager.save_page(checkpoint_dir, pnum, page_text)
+                                        await checkpoint_manager.save_page(checkpoint_dir, pnum, page_text)
                                         if pnum in failed_pages_metadata:
                                             del failed_pages_metadata[pnum]
-                                checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                                await checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
                             else:
                                 raise
                     else:
@@ -405,21 +414,21 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                                 if failed_pages_metadata[pnum]["attempts"] < 2:
                                     pages_to_retry.append((pnum, img))
                                 else:
-                                    checkpoint_manager.save_page(checkpoint_dir, pnum, "")
+                                    await checkpoint_manager.save_page(checkpoint_dir, pnum, "")
                             else:
                                 pages[pnum - 1] = page_text
                                 pages_processed += 1
-                                checkpoint_manager.save_page(checkpoint_dir, pnum, page_text)
+                                await checkpoint_manager.save_page(checkpoint_dir, pnum, page_text)
                                 if pnum in failed_pages_metadata:
                                     del failed_pages_metadata[pnum]
-                        checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                        await checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
                     
                     inference_duration = perf_counter() - inference_started_at
                     
                     # Update progress at configured interval
                     if pages_processed % settings.checkpoint_save_interval == 0 or page_number == total_pages:
                         completed_count = len(completed_page_numbers) + pages_processed
-                        checkpoint_manager.update_progress(checkpoint_dir, completed_count, total_pages, "processing")
+                        await checkpoint_manager.update_progress(checkpoint_dir, completed_count, total_pages, "processing")
                         if settings.ocr_debug:
                             logger.info(
                                 "Checkpoint saved: file=%s progress=%d/%d",
@@ -460,13 +469,13 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                         if settings.backend == "gemini" and gemini_backend:
                             try:
                                 retry_images = [img for _, img in retry_batch]
-                                retry_results = gemini_backend.transcribe_batch(retry_images)
+                                retry_results = await gemini_backend.transcribe_batch(retry_images)
                                 
                                 for (rnum, _), (text, reason) in zip(retry_batch, retry_results):
                                     if reason is None:
                                         pages[rnum - 1] = text
                                         pages_processed += 1
-                                        checkpoint_manager.save_page(checkpoint_dir, rnum, text)
+                                        await checkpoint_manager.save_page(checkpoint_dir, rnum, text)
                                         if rnum in failed_pages_metadata:
                                             del failed_pages_metadata[rnum]
                                     else:
@@ -479,9 +488,9 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                                             reason,
                                             failed_pages_metadata[rnum]["attempts"],
                                         )
-                                        checkpoint_manager.save_page(checkpoint_dir, rnum, "")
+                                        await checkpoint_manager.save_page(checkpoint_dir, rnum, "")
                                 
-                                checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                                await checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
                             except Exception as exc:
                                 logger.error("Gemini retry batch failed: %s", exc)
                                 if settings.gemini_fallback_to_local:
@@ -492,18 +501,18 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                                                 "Page %d/%d still empty after local fallback — marking done, skipping",
                                                 rnum, total_pages,
                                             )
-                                            checkpoint_manager.save_page(checkpoint_dir, rnum, "")
+                                            await checkpoint_manager.save_page(checkpoint_dir, rnum, "")
                                         else:
                                             pages[rnum - 1] = page_text
                                             pages_processed += 1
-                                            checkpoint_manager.save_page(checkpoint_dir, rnum, page_text)
+                                            await checkpoint_manager.save_page(checkpoint_dir, rnum, page_text)
                                             if rnum in failed_pages_metadata:
                                                 del failed_pages_metadata[rnum]
-                                    checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                                    await checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
                                 else:
                                     # Mark all as empty
                                     for rnum, _ in retry_batch:
-                                        checkpoint_manager.save_page(checkpoint_dir, rnum, "")
+                                        await checkpoint_manager.save_page(checkpoint_dir, rnum, "")
                         else:
                             # Local backend retry
                             for rnum, rimg in retry_batch:
@@ -513,19 +522,19 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                                         "Page %d/%d still empty after retry — marking done, skipping",
                                         rnum, total_pages,
                                     )
-                                    checkpoint_manager.save_page(checkpoint_dir, rnum, "")
+                                    await checkpoint_manager.save_page(checkpoint_dir, rnum, "")
                                 else:
                                     pages[rnum - 1] = page_text
                                     pages_processed += 1
-                                    checkpoint_manager.save_page(checkpoint_dir, rnum, page_text)
+                                    await checkpoint_manager.save_page(checkpoint_dir, rnum, page_text)
                                     if rnum in failed_pages_metadata:
                                         del failed_pages_metadata[rnum]
-                            checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                            await checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
                         
                         retry_batch = []
 
             # Mark as completed
-            checkpoint_manager.update_progress(checkpoint_dir, total_pages, total_pages, "completed")
+            await checkpoint_manager.update_progress(checkpoint_dir, total_pages, total_pages, "completed")
             non_empty_pages = [p for p in pages if p.strip()]
             text = "\n\n".join(non_empty_pages).strip()
             if settings.ocr_debug:

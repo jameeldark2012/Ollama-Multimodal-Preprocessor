@@ -10,10 +10,13 @@ Features:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from io import BytesIO
 
 from google import genai
@@ -101,7 +104,6 @@ class GeminiOCRBackend:
         self.batch_size = max(1, batch_size)
         self.timeout_seconds = timeout_seconds
         self.max_output_tokens = max_output_tokens
-
         # Configure API
         self.client = genai.Client(api_key=api_key)
 
@@ -110,6 +112,13 @@ class GeminiOCRBackend:
             rpm_limit=rpm_limit,
             tpm_limit=tpm_limit,
             safety_margin=safety_margin,
+        )
+        # Gemini's SDK is synchronous. Keep its long-lived network waits out
+        # of asyncio's shared executor, which is also used for PDF rendering,
+        # checkpoint I/O, and video work.
+        self._request_executor = ThreadPoolExecutor(
+            max_workers=min(self.rate_limiter.effective_rpm, 16),
+            thread_name_prefix="gemini-request",
         )
 
         self.request_count = 0
@@ -128,7 +137,39 @@ class GeminiOCRBackend:
     # Public API
     # ------------------------------------------------------------------
 
-    def transcribe_batch(self, images: list[bytes]) -> list[tuple[str, str | None]]:
+    async def transcribe_batch(self, images: list[bytes]) -> list[tuple[str, str | None]]:
+        """Transcribe images while keeping each API request inside the TPM budget."""
+        if not images:
+            return []
+
+        prompt_tokens = (
+            estimate_text_tokens(SYSTEM_PROMPT)
+            + estimate_text_tokens("Copy the text from these images.")
+        )
+        results: list[tuple[str, str | None]] = []
+        batch: list[bytes] = []
+        batch_tokens = prompt_tokens
+
+        for image in images[: self.batch_size]:
+            with Image.open(BytesIO(image)) as opened_image:
+                image_tokens = estimate_image_tokens(*opened_image.size)
+
+            # Split configured batches before they exceed the limiter's
+            # effective TPM budget. A lone huge image still has to be sent as
+            # one request; RateLimiter reserves the entire minute for it.
+            if batch and batch_tokens + image_tokens > self.rate_limiter.effective_tpm:
+                results.extend(await self._transcribe_batch(batch))
+                batch = []
+                batch_tokens = prompt_tokens
+
+            batch.append(image)
+            batch_tokens += image_tokens
+
+        if batch:
+            results.extend(await self._transcribe_batch(batch))
+        return results
+
+    async def _transcribe_batch(self, images: list[bytes]) -> list[tuple[str, str | None]]:
         """
         Transcribe a batch of images (up to batch_size at once).
 
@@ -173,7 +214,7 @@ class GeminiOCRBackend:
             # --- retry loop for transient errors on the same model ---
             for attempt in range(len(_RETRY_DELAYS) + 1):
                 try:
-                    texts = self._transcribe_with_model(model_name, batch, total_tokens)
+                    texts = await self._transcribe_with_model(model_name, batch, total_tokens)
                     # Success! Return with no failure reasons
                     return [(text, None) for text in texts]
                 except Exception as exc:
@@ -202,7 +243,7 @@ class GeminiOCRBackend:
                             delay,
                             exc,
                         )
-                        time.sleep(delay)
+                        await asyncio.sleep(delay)
                         continue  # retry same model
 
                     # Non-transient, non-RECITATION error → try next model
@@ -233,7 +274,7 @@ class GeminiOCRBackend:
                 
                 for model_name in self._get_model_fallback_chain():
                     try:
-                        results = self._transcribe_with_model(
+                        results = await self._transcribe_with_model(
                             model_name, [img_bytes], page_token_est
                         )
                         page_result = results[0] if results else ""
@@ -279,7 +320,7 @@ class GeminiOCRBackend:
                 chain.append(model)
         return chain
 
-    def _transcribe_with_model(
+    async def _transcribe_with_model(
         self, model_name: str, images: list[bytes], estimated_tokens: int
     ) -> list[str]:
         """
@@ -297,7 +338,7 @@ class GeminiOCRBackend:
             Exception: On API or parsing error
         """
         # Wait for rate limits
-        self.rate_limiter.wait(estimated_tokens=estimated_tokens)
+        await self.rate_limiter.wait(estimated_tokens=estimated_tokens)
         self.request_count += 1
 
         if logger.isEnabledFor(logging.INFO):
@@ -341,14 +382,18 @@ class GeminiOCRBackend:
                 f"{marker_examples}"
             )
 
-        # Call Gemini API
-        response = self.client.models.generate_content(
+        # Call Gemini API - SDK is sync, so run in thread pool
+        call = partial(
+            self.client.models.generate_content,
             model=model_name,
             contents=contents,
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 max_output_tokens=self.max_output_tokens,
             ),
+        )
+        response = await asyncio.get_running_loop().run_in_executor(
+            self._request_executor, call
         )
 
         # Extract text

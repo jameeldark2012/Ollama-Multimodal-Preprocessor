@@ -1,6 +1,7 @@
 """
 Comprehensive tests for RateLimiter to ensure it respects TPM and RPM limits.
 """
+import asyncio
 import time
 import pytest
 from app.rate_limiter import RateLimiter, estimate_text_tokens, estimate_image_tokens
@@ -41,19 +42,21 @@ class TestTokenEstimation:
 class TestRateLimiterRPM:
     """Test RPM (requests per minute) limiting."""
     
-    def test_rpm_basic(self):
+    @pytest.mark.asyncio
+    async def test_rpm_basic(self):
         """Should allow requests up to RPM limit."""
         limiter = RateLimiter(rpm_limit=5, tpm_limit=100000, safety_margin=1.0)
         
         start = time.time()
         for i in range(5):
-            limiter.wait(estimated_tokens=100)
+            await limiter.wait(estimated_tokens=100)
         elapsed = time.time() - start
         
         # Should complete immediately (no waiting)
         assert elapsed < 0.5  # Allow 500ms for overhead
     
-    def test_rpm_blocking(self):
+    @pytest.mark.asyncio
+    async def test_rpm_blocking(self):
         """Should block when RPM limit is exceeded."""
         limiter = RateLimiter(rpm_limit=3, tpm_limit=100000, safety_margin=1.0)
         
@@ -61,10 +64,10 @@ class TestRateLimiterRPM:
         
         # First 3 requests: instant
         for i in range(3):
-            limiter.wait(estimated_tokens=100)
+            await limiter.wait(estimated_tokens=100)
         
         # 4th request should wait ~60 seconds
-        limiter.wait(estimated_tokens=100)
+        await limiter.wait(estimated_tokens=100)
         
         elapsed = time.time() - start
         
@@ -72,7 +75,8 @@ class TestRateLimiterRPM:
         assert elapsed >= 55.0  # At least 55 seconds
         assert elapsed <= 65.0  # But not more than 65 seconds
     
-    def test_rpm_safety_margin(self):
+    @pytest.mark.asyncio
+    async def test_rpm_safety_margin(self):
         """Safety margin should reduce effective RPM."""
         limiter = RateLimiter(rpm_limit=10, tpm_limit=100000, safety_margin=0.5)
         
@@ -83,14 +87,14 @@ class TestRateLimiterRPM:
         
         # First 5 should be instant
         for i in range(5):
-            limiter.wait(estimated_tokens=100)
+            await limiter.wait(estimated_tokens=100)
         
         elapsed_first = time.time() - start
         assert elapsed_first < 0.5
         
         # 6th should block
         start_block = time.time()
-        limiter.wait(estimated_tokens=100)
+        await limiter.wait(estimated_tokens=100)
         elapsed_block = time.time() - start_block
         
         assert elapsed_block >= 55.0
@@ -99,31 +103,33 @@ class TestRateLimiterRPM:
 class TestRateLimiterTPM:
     """Test TPM (tokens per minute) limiting."""
     
-    def test_tpm_basic(self):
+    @pytest.mark.asyncio
+    async def test_tpm_basic(self):
         """Should allow tokens up to TPM limit."""
         limiter = RateLimiter(rpm_limit=1000, tpm_limit=10000, safety_margin=1.0)
         
         start = time.time()
         # Use 9000 tokens total (under 10K limit)
         for i in range(3):
-            limiter.wait(estimated_tokens=3000)
+            await limiter.wait(estimated_tokens=3000)
         elapsed = time.time() - start
         
         # Should complete immediately
         assert elapsed < 0.5
     
-    def test_tpm_blocking(self):
+    @pytest.mark.asyncio
+    async def test_tpm_blocking(self):
         """Should block when TPM limit is exceeded."""
         limiter = RateLimiter(rpm_limit=1000, tpm_limit=5000, safety_margin=1.0)
         
         start = time.time()
         
         # First request: 3000 tokens (ok)
-        limiter.wait(estimated_tokens=3000)
+        await limiter.wait(estimated_tokens=3000)
         
         # Second request: 3000 tokens (total 6000, exceeds 5000)
         # Should wait ~60 seconds for first request to expire
-        limiter.wait(estimated_tokens=3000)
+        await limiter.wait(estimated_tokens=3000)
         
         elapsed = time.time() - start
         
@@ -131,7 +137,8 @@ class TestRateLimiterTPM:
         assert elapsed >= 55.0
         assert elapsed <= 65.0
     
-    def test_tpm_safety_margin(self):
+    @pytest.mark.asyncio
+    async def test_tpm_safety_margin(self):
         """Safety margin should reduce effective TPM."""
         limiter = RateLimiter(rpm_limit=1000, tpm_limit=10000, safety_margin=0.8)
         
@@ -141,13 +148,13 @@ class TestRateLimiterTPM:
         start = time.time()
         
         # 7000 tokens should be ok
-        limiter.wait(estimated_tokens=7000)
+        await limiter.wait(estimated_tokens=7000)
         elapsed_first = time.time() - start
         assert elapsed_first < 0.5
         
         # Another 2000 tokens (total 9000) should block
         start_block = time.time()
-        limiter.wait(estimated_tokens=2000)
+        await limiter.wait(estimated_tokens=2000)
         elapsed_block = time.time() - start_block
         
         assert elapsed_block >= 55.0
@@ -156,7 +163,8 @@ class TestRateLimiterTPM:
 class TestRateLimiterIntegration:
     """Test combined RPM and TPM limiting (realistic scenarios)."""
     
-    def test_gemini_free_tier_simulation(self):
+    @pytest.mark.asyncio
+    async def test_gemini_free_tier_simulation(self):
         """Simulate Gemini free tier: 10 RPM, 65K TPM."""
         limiter = RateLimiter(rpm_limit=10, tpm_limit=65000, safety_margin=0.8)
         
@@ -168,13 +176,14 @@ class TestRateLimiterIntegration:
         
         # 5 requests with 5K tokens each (25K total)
         for i in range(5):
-            limiter.wait(estimated_tokens=5000)
+            await limiter.wait(estimated_tokens=5000)
         
         elapsed = time.time() - start
         # Should be immediate (under both limits)
         assert elapsed < 1.0
     
-    def test_gemini_paid_tier_simulation(self):
+    @pytest.mark.asyncio
+    async def test_gemini_paid_tier_simulation(self):
         """Simulate Gemini paid tier: 12 RPM, 220K TPM."""
         limiter = RateLimiter(rpm_limit=12, tpm_limit=220000, safety_margin=0.9)
         
@@ -186,13 +195,14 @@ class TestRateLimiterIntegration:
         
         # 8 requests with 20K tokens each (160K total)
         for i in range(8):
-            limiter.wait(estimated_tokens=20000)
+            await limiter.wait(estimated_tokens=20000)
         
         elapsed = time.time() - start
         # Should be immediate (under both limits)
         assert elapsed < 1.0
     
-    def test_batch_processing_scenario(self):
+    @pytest.mark.asyncio
+    async def test_batch_processing_scenario(self):
         """Test realistic batch processing with 20 pages."""
         limiter = RateLimiter(rpm_limit=12, tpm_limit=220000, safety_margin=0.9)
         
@@ -204,34 +214,35 @@ class TestRateLimiterIntegration:
         
         # First 3 batches should be immediate
         for i in range(3):
-            limiter.wait(estimated_tokens=60000)
+            await limiter.wait(estimated_tokens=60000)
         
         elapsed_first = time.time() - start
         assert elapsed_first < 1.0  # 180K tokens, under 198K limit
         
         # 4th batch (total 240K) should wait
         start_wait = time.time()
-        limiter.wait(estimated_tokens=60000)
+        await limiter.wait(estimated_tokens=60000)
         elapsed_wait = time.time() - start_wait
         
         # Should wait for oldest batch to expire (~60s)
         assert elapsed_wait >= 55.0
     
-    def test_sliding_window(self):
+    @pytest.mark.asyncio
+    async def test_sliding_window(self):
         """Test that sliding 60-second window works correctly."""
         limiter = RateLimiter(rpm_limit=5, tpm_limit=100000, safety_margin=1.0)
         
         # Make 3 requests immediately
         for i in range(3):
-            limiter.wait(estimated_tokens=1000)
+            await limiter.wait(estimated_tokens=1000)
         
         # Wait 61 seconds (requests should expire)
-        time.sleep(61)
+        await asyncio.sleep(61)
         
         # Should be able to make 5 more requests immediately
         start = time.time()
         for i in range(5):
-            limiter.wait(estimated_tokens=1000)
+            await limiter.wait(estimated_tokens=1000)
         elapsed = time.time() - start
         
         assert elapsed < 1.0  # Should be immediate
@@ -240,12 +251,13 @@ class TestRateLimiterIntegration:
 class TestRateLimiterEdgeCases:
     """Test edge cases and error handling."""
     
-    def test_zero_tokens(self):
+    @pytest.mark.asyncio
+    async def test_zero_tokens(self):
         """Zero tokens should not block."""
         limiter = RateLimiter(rpm_limit=5, tpm_limit=10000, safety_margin=1.0)
         
         start = time.time()
-        limiter.wait(estimated_tokens=0)
+        await limiter.wait(estimated_tokens=0)
         elapsed = time.time() - start
         
         assert elapsed < 0.1

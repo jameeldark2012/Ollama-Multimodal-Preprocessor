@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 
@@ -29,7 +30,7 @@ class RateLimiter:
 
     Usage:
         limiter = RateLimiter(tpm_limit=65000, rpm_limit=10, safety_margin=0.8)
-        limiter.wait(estimated_tokens=6000)   # blocks if needed, then records the call
+        await limiter.wait(estimated_tokens=6000)   # async waits if needed, then records the call
     """
 
     def __init__(
@@ -44,17 +45,56 @@ class RateLimiter:
         self.safety_margin = max(0.05, min(1.0, float(safety_margin)))
         self.effective_tpm = max(1, int(self.tpm_limit * self.safety_margin))
         self.effective_rpm = max(1, int(self.rpm_limit * self.safety_margin))
-        self._timestamps: deque[tuple[float, int]] = deque()
+        # Entries are reservations for request start times.  Future entries are
+        # intentional: they keep concurrent coroutines from selecting the same
+        # available slot while one of them is asleep.
+        self._reservations: deque[tuple[float, int]] = deque()
+        # Kept as compatibility aliases for diagnostics and existing callers.
+        self._timestamps = self._reservations
         self._request_times: deque[float] = deque()
+        self._lock = asyncio.Lock()
 
-    def wait(self, estimated_tokens: int = 0) -> None:
-        """Block until both TPM and RPM budgets allow the next request, then record it."""
-        token_delay = self._wait_seconds_for_tokens(estimated_tokens)
-        if token_delay > 0:
-            time.sleep(token_delay)
-        rpm_delay = self._wait_seconds_for_rpm()
-        if rpm_delay > 0:
-            time.sleep(rpm_delay)
+    async def wait(self, estimated_tokens: int = 0) -> None:
+        """Reserve and wait for one request slot without blocking the event loop."""
+        # A single image can legitimately estimate above a conservative TPM
+        # budget.  It cannot be split further here, so reserve a full minute's
+        # budget rather than repeatedly scheduling it forever.
+        tokens = min(max(0, estimated_tokens), self.effective_tpm)
+        async with self._lock:
+            now = time.monotonic()
+            while self._reservations and self._reservations[0][0] <= now - 60:
+                self._reservations.popleft()
+
+            scheduled_at = now
+            while True:
+                window = [(timestamp, cost) for timestamp, cost in self._reservations if timestamp > scheduled_at - 60]
+                token_total = sum(cost for _, cost in window)
+                request_total = len(window)
+                if token_total + tokens <= self.effective_tpm and request_total < self.effective_rpm:
+                    break
+
+                expirations = [timestamp + 60 for timestamp, _ in window if timestamp + 60 > scheduled_at]
+                # There is always an expiration when a non-empty window is
+                # over either budget; this guard also prevents a busy loop.
+                scheduled_at = min(expirations) if expirations else scheduled_at + 60
+
+            self._reservations.append((scheduled_at, tokens))
+            self._request_times.append(scheduled_at)
+            delay = max(0.0, scheduled_at - now)
+
+        if delay:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                # Do not burn a quota slot for a request that will never be
+                # sent (for example, when its HTTP request is cancelled).
+                async with self._lock:
+                    try:
+                        self._reservations.remove((scheduled_at, tokens))
+                        self._request_times.remove(scheduled_at)
+                    except ValueError:
+                        pass
+                raise
 
     def _wait_seconds_for_tokens(self, estimated_tokens: int) -> float:
         if estimated_tokens <= 0:
