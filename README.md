@@ -52,6 +52,41 @@ llama-server.exe `
   --n-gpu-layers 99 --ctx-size 32768
 ```
 
+### Gemini (Google AI)
+
+Uses the Google Gemini API with intelligent batch processing and rate limiting. Perfect for the free tier with its 10 RPM and 65K TPM limits. Processes multiple PDF pages in a single request to maximize efficiency and minimize API calls.
+
+**Features:**
+- **Batch Processing**: Process up to 10 PDF pages per request (configurable via `GEMINI_BATCH_SIZE`)
+- **Rate Limiting**: Respects both RPM and TPM limits with configurable safety margins
+- **Token Estimation**: Accurately estimates image tokens based on dimensions (Gemini charges ~258 tokens per 256×256 tile)
+- **Model Fallback**: Automatically falls back through `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemini-2.5-flash-lite`
+- **Local Fallback**: Optionally falls back to Ollama/llama.cpp if all Gemini models fail (`GEMINI_FALLBACK_TO_LOCAL=true`)
+
+Relevant `.env` settings:
+
+```env
+BACKEND=gemini
+GEMINI_API_KEY=your-api-key-here
+GEMINI_MODEL=gemini-3.5-flash-lite
+GEMINI_BATCH_SIZE=5                # Pages per request (1-10)
+GEMINI_RPM_LIMIT=10                # Requests per minute
+GEMINI_TPM_LIMIT=65000             # Tokens per minute
+GEMINI_SAFETY_MARGIN=0.8           # Use 80% of limits to avoid hitting caps
+GEMINI_TIMEOUT_SECONDS=300         # Request timeout
+GEMINI_FALLBACK_TO_LOCAL=true     # Fall back to local if Gemini fails
+```
+
+Get your API key from: https://aistudio.google.com/app/apikey
+
+**Free Tier Limits:**
+- 10 requests per minute (RPM)
+- 65,000 tokens per minute (TPM)
+- The rate limiter uses a safety margin (default 80%) to stay comfortably under these limits
+
+**Batch Processing Example:**
+A 50-page PDF with batch size 5 will make 10 requests instead of 50, staying well within the free tier's 10 RPM limit. Each batch processes multiple pages in one API call, making the most of your quota.
+
 Set `OCR_DEBUG=true` in `.env` and restart the backend to log the processing stages, PDF render time, per-page model and total time, and overall request duration. Set it to `false` (or remove it) to disable these logs.
 
 ## Open WebUI

@@ -1,5 +1,6 @@
 import base64
 import logging
+from datetime import datetime
 from io import BytesIO
 from pathlib import PurePath
 from time import perf_counter
@@ -15,6 +16,28 @@ from app.config import settings
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
 checkpoint_manager = CheckpointManager(settings.checkpoint_dir)
+
+# Initialize Gemini backend if configured
+gemini_backend = None
+if settings.backend == "gemini" and settings.gemini_api_key:
+    try:
+        from app.gemini_backend import GeminiOCRBackend
+        gemini_backend = GeminiOCRBackend(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_model,
+            batch_size=settings.gemini_batch_size,
+            rpm_limit=settings.gemini_rpm_limit,
+            tpm_limit=settings.gemini_tpm_limit,
+            safety_margin=settings.gemini_safety_margin,
+            timeout_seconds=settings.gemini_timeout_seconds,
+            max_output_tokens=settings.gemini_max_output_tokens,
+        )
+        logger.info("Gemini backend initialized successfully")
+    except Exception as exc:
+        logger.error("Failed to initialize Gemini backend: %s", exc)
+        if not settings.gemini_fallback_to_local:
+            raise
+
 TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".html", ".xml", ".yaml", ".yml"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 SYSTEM_PROMPT = (
@@ -80,10 +103,38 @@ def _to_jpeg(image_bytes: bytes, quality: int = 85) -> bytes:
         return buf.getvalue()
 
 
-async def _ask_model(image_bytes: bytes, timeout_seconds: float) -> str:
-    """Route the request to the configured backend. Assumes image_bytes is JPEG. Creates its own client."""
+async def _ask_model(image_bytes: bytes, timeout_seconds: float, force_local: bool = False) -> str:
+    """
+    Route the request to the configured backend with fallback support.
+    
+    If Gemini is configured and fails, falls back to local (Ollama/llama.cpp) if enabled.
+    Assumes image_bytes is JPEG. Creates its own client for HTTP backends.
+    
+    Args:
+        image_bytes: JPEG image bytes
+        timeout_seconds: Request timeout
+        force_local: If True, skip Gemini and go straight to local backend
+    """
+    # Try Gemini first if configured AND not forcing local
+    if not force_local and settings.backend == "gemini" and gemini_backend is not None:
+        try:
+            results = gemini_backend.transcribe_batch([image_bytes])
+            return results[0] if results else ""
+        except Exception as exc:
+            logger.error("Gemini backend failed: %s", exc)
+            if settings.gemini_fallback_to_local:
+                logger.info("Falling back to local backend (Ollama/llama.cpp)")
+            else:
+                raise
+
+    # Determine which local backend to use.
+    # When falling back from Gemini, honour GEMINI_LOCAL_FALLBACK_BACKEND if set.
+    local_backend = settings.backend
+    if local_backend == "gemini":
+        local_backend = settings.gemini_local_fallback_backend or "ollama"
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
-        if settings.backend == "llamacpp":
+        if local_backend == "llamacpp":
             return await _ask_llamacpp(client, image_bytes)
         return await _ask_ollama(client, image_bytes)
 
@@ -156,16 +207,18 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                             total_pages,
                         )
                     pages = checkpoint_manager.load_all_pages(checkpoint_info.checkpoint_dir, total_pages)
-                    text = "\n\n".join(pages).strip()
+                    non_empty_pages = [p for p in pages if p.strip()]
+                    text = "\n\n".join(non_empty_pages).strip()
                     if settings.ocr_debug:
                         logger.info(
-                            "OCR finished (cached): file=%s pages=%d chars=%d total=%.2fs",
+                            "OCR finished (cached): file=%s pages=%d (non-empty=%d) chars=%d total=%.2fs",
                             filename,
-                            len(pages),
+                            total_pages,
+                            len(non_empty_pages),
                             len(text),
                             perf_counter() - started_at,
                         )
-                    return text, len(pages)
+                    return text, len(non_empty_pages)
                 else:
                     # Resume partial processing
                     if settings.ocr_debug:
@@ -187,13 +240,48 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                 if settings.ocr_debug:
                     logger.info("Created new checkpoint: file=%s hash=%s pages=%d", filename, file_hash, total_pages)
 
-            # Process pages
+            # Process pages - batch when using Gemini, one-by-one otherwise
             pages_processed = 0
+            pending_pages: list[tuple[int, bytes]] = []  # (page_number, image_bytes)
+            failed_pages_metadata: dict[int, dict] = checkpoint_manager.load_failed_pages(checkpoint_dir)
+            
+            # Determine batch size
+            batch_size = gemini_backend.batch_size if (settings.backend == "gemini" and gemini_backend) else 1
+            
+            # Extract pages that need retry (not RECITATION, attempts < 2)
+            pages_to_retry: list[tuple[int, bytes]] = []
+            for page_num in range(1, total_pages + 1):
+                if page_num in completed_page_numbers:
+                    continue  # Already successfully processed
+                if page_num in failed_pages_metadata:
+                    meta = failed_pages_metadata[page_num]
+                    if meta["reason"] != "recitation" and meta["attempts"] < 2:
+                        # This page needs retry - render it
+                        page_started_at = perf_counter()
+                        page = document[page_num - 1]
+                        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                        page_image = pixmap.tobytes("jpeg", jpg_quality=85)
+                        pixmap = None
+                        pages_to_retry.append((page_num, page_image))
+                        if settings.ocr_debug:
+                            logger.info(
+                                "Queueing retry: file=%s page=%d/%d reason=%s attempts=%d",
+                                filename,
+                                page_num,
+                                total_pages,
+                                meta["reason"],
+                                meta["attempts"],
+                            )
+            
             for page_number, page in enumerate(document, start=1):
                 # Skip already completed pages
                 if page_number in completed_page_numbers:
                     if settings.ocr_debug:
                         logger.info("Skipping completed page: file=%s page=%d/%d", filename, page_number, total_pages)
+                    continue
+                
+                # Skip pages already queued for retry
+                if any(pnum == page_number for pnum, _ in pages_to_retry):
                     continue
 
                 page_started_at = perf_counter()
@@ -211,60 +299,257 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                         render_duration,
                         len(page_image),
                     )
-                inference_started_at = perf_counter()
-                page_text = await _ask_model(page_image, settings.ollama_timeout_seconds)
-                page_image = None  # Release JPEG bytes immediately after sending
-                inference_duration = perf_counter() - inference_started_at
-                pages[page_number - 1] = page_text
-                pages_processed += 1
+                
+                # Add to batch
+                pending_pages.append((page_number, page_image))
+                
+                # Process batch when full or at end of document
+                if len(pending_pages) >= batch_size or page_number == total_pages:
+                    inference_started_at = perf_counter()
+                    
+                    if settings.backend == "gemini" and gemini_backend:
+                        # Batch process with Gemini
+                        try:
+                            images = [img for _, img in pending_pages]
+                            results = gemini_backend.transcribe_batch(images)
+                            
+                            # Process results with failure tracking
+                            for (pnum, img), (text, reason) in zip(pending_pages, results):
+                                if reason is None:
+                                    # Success!
+                                    pages[pnum - 1] = text
+                                    pages_processed += 1
+                                    checkpoint_manager.save_page(checkpoint_dir, pnum, text)
+                                    # Remove from failed metadata if it was there
+                                    if pnum in failed_pages_metadata:
+                                        del failed_pages_metadata[pnum]
+                                else:
+                                    # Failure - track it
+                                    if pnum in failed_pages_metadata:
+                                        failed_pages_metadata[pnum]["attempts"] += 1
+                                        failed_pages_metadata[pnum]["reason"] = reason
+                                    else:
+                                        failed_pages_metadata[pnum] = {
+                                            "reason": reason,
+                                            "attempts": 1,
+                                            "last_tried": datetime.now().isoformat(),
+                                        }
+                                    
+                                    # Only queue for retry if not RECITATION and attempts < 2
+                                    if reason != "recitation" and failed_pages_metadata[pnum]["attempts"] < 2:
+                                        pages_to_retry.append((pnum, img))
+                                        if settings.ocr_debug:
+                                            logger.info(
+                                                "Page %d/%d failed (reason=%s, attempts=%d) — queuing for retry",
+                                                pnum,
+                                                total_pages,
+                                                reason,
+                                                failed_pages_metadata[pnum]["attempts"],
+                                            )
+                                    else:
+                                        logger.warning(
+                                            "Page %d/%d permanently failed (reason=%s, attempts=%d) — marking as empty",
+                                            pnum,
+                                            total_pages,
+                                            reason,
+                                            failed_pages_metadata[pnum]["attempts"],
+                                        )
+                                        checkpoint_manager.save_page(checkpoint_dir, pnum, "")
+                            
+                            # Save failed pages metadata
+                            checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
 
-                # Save page to checkpoint
-                checkpoint_manager.save_page(checkpoint_dir, page_number, page_text)
+                        except Exception as exc:
+                            logger.error("Gemini batch processing failed: %s", exc)
+                            # Fall back to local processing if enabled
+                            if settings.gemini_fallback_to_local:
+                                logger.info("Falling back to local processing for batch of %d pages", len(pending_pages))
+                                for pnum, img in pending_pages:
+                                    page_text = await _ask_model(img, settings.ollama_timeout_seconds, force_local=True)
+                                    if not page_text.strip():
+                                        # Track as failed
+                                        if pnum in failed_pages_metadata:
+                                            failed_pages_metadata[pnum]["attempts"] += 1
+                                        else:
+                                            failed_pages_metadata[pnum] = {
+                                                "reason": "empty",
+                                                "attempts": 1,
+                                                "last_tried": datetime.now().isoformat(),
+                                            }
+                                        if failed_pages_metadata[pnum]["attempts"] < 2:
+                                            pages_to_retry.append((pnum, img))
+                                        else:
+                                            checkpoint_manager.save_page(checkpoint_dir, pnum, "")
+                                    else:
+                                        pages[pnum - 1] = page_text
+                                        pages_processed += 1
+                                        checkpoint_manager.save_page(checkpoint_dir, pnum, page_text)
+                                        if pnum in failed_pages_metadata:
+                                            del failed_pages_metadata[pnum]
+                                checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                            else:
+                                raise
+                    else:
+                        # Process one-by-one with local backend
+                        for pnum, img in pending_pages:
+                            page_text = await _ask_model(img, settings.ollama_timeout_seconds)
+                            if not page_text.strip():
+                                if pnum in failed_pages_metadata:
+                                    failed_pages_metadata[pnum]["attempts"] += 1
+                                else:
+                                    failed_pages_metadata[pnum] = {
+                                        "reason": "empty",
+                                        "attempts": 1,
+                                        "last_tried": datetime.now().isoformat(),
+                                    }
+                                if failed_pages_metadata[pnum]["attempts"] < 2:
+                                    pages_to_retry.append((pnum, img))
+                                else:
+                                    checkpoint_manager.save_page(checkpoint_dir, pnum, "")
+                            else:
+                                pages[pnum - 1] = page_text
+                                pages_processed += 1
+                                checkpoint_manager.save_page(checkpoint_dir, pnum, page_text)
+                                if pnum in failed_pages_metadata:
+                                    del failed_pages_metadata[pnum]
+                        checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                    
+                    inference_duration = perf_counter() - inference_started_at
+                    
+                    # Update progress at configured interval
+                    if pages_processed % settings.checkpoint_save_interval == 0 or page_number == total_pages:
+                        completed_count = len(completed_page_numbers) + pages_processed
+                        checkpoint_manager.update_progress(checkpoint_dir, completed_count, total_pages, "processing")
+                        if settings.ocr_debug:
+                            logger.info(
+                                "Checkpoint saved: file=%s progress=%d/%d",
+                                filename,
+                                completed_count,
+                                total_pages,
+                            )
 
-                # Update progress at configured interval
-                if pages_processed % settings.checkpoint_save_interval == 0:
-                    completed_count = len(completed_page_numbers) + pages_processed
-                    checkpoint_manager.update_progress(checkpoint_dir, completed_count, total_pages, "processing")
                     if settings.ocr_debug:
+                        pages_in_batch = len(pending_pages)
                         logger.info(
-                            "Checkpoint saved: file=%s progress=%d/%d",
+                            "PDF batch completed: file=%s pages=%d model=%.2fs batch_total=%.2fs",
                             filename,
-                            completed_count,
-                            total_pages,
+                            pages_in_batch,
+                            inference_duration,
+                            perf_counter() - page_started_at,
                         )
+                    
+                    # Clear batch
+                    pending_pages = []
 
-                if settings.ocr_debug:
-                    logger.info(
-                        "PDF page completed: file=%s page=%d/%d model=%.2fs page_total=%.2fs chars=%d",
-                        filename,
-                        page_number,
-                        total_pages,
-                        inference_duration,
-                        perf_counter() - page_started_at,
-                        len(page_text),
-                    )
+            # --- Retry phase: process retryable failed pages in proper batches ---
+            if pages_to_retry:
+                logger.info(
+                    "Retrying %d pages that failed with transient errors — processing in batches of %d",
+                    len(pages_to_retry),
+                    batch_size,
+                )
+                # Sort by page number to maintain sequence
+                pages_to_retry.sort(key=lambda x: x[0])
+                
+                retry_batch: list[tuple[int, bytes]] = []
+                for pnum, img in pages_to_retry:
+                    retry_batch.append((pnum, img))
+                    
+                    if len(retry_batch) >= batch_size or (pnum, img) == pages_to_retry[-1]:
+                        # Process retry batch
+                        if settings.backend == "gemini" and gemini_backend:
+                            try:
+                                retry_images = [img for _, img in retry_batch]
+                                retry_results = gemini_backend.transcribe_batch(retry_images)
+                                
+                                for (rnum, _), (text, reason) in zip(retry_batch, retry_results):
+                                    if reason is None:
+                                        pages[rnum - 1] = text
+                                        pages_processed += 1
+                                        checkpoint_manager.save_page(checkpoint_dir, rnum, text)
+                                        if rnum in failed_pages_metadata:
+                                            del failed_pages_metadata[rnum]
+                                    else:
+                                        failed_pages_metadata[rnum]["attempts"] += 1
+                                        failed_pages_metadata[rnum]["reason"] = reason
+                                        logger.warning(
+                                            "Page %d/%d still failed after retry (reason=%s, attempts=%d) — marking as empty",
+                                            rnum,
+                                            total_pages,
+                                            reason,
+                                            failed_pages_metadata[rnum]["attempts"],
+                                        )
+                                        checkpoint_manager.save_page(checkpoint_dir, rnum, "")
+                                
+                                checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                            except Exception as exc:
+                                logger.error("Gemini retry batch failed: %s", exc)
+                                if settings.gemini_fallback_to_local:
+                                    for rnum, rimg in retry_batch:
+                                        page_text = await _ask_model(rimg, settings.ollama_timeout_seconds, force_local=True)
+                                        if not page_text.strip():
+                                            logger.warning(
+                                                "Page %d/%d still empty after local fallback — marking done, skipping",
+                                                rnum, total_pages,
+                                            )
+                                            checkpoint_manager.save_page(checkpoint_dir, rnum, "")
+                                        else:
+                                            pages[rnum - 1] = page_text
+                                            pages_processed += 1
+                                            checkpoint_manager.save_page(checkpoint_dir, rnum, page_text)
+                                            if rnum in failed_pages_metadata:
+                                                del failed_pages_metadata[rnum]
+                                    checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                                else:
+                                    # Mark all as empty
+                                    for rnum, _ in retry_batch:
+                                        checkpoint_manager.save_page(checkpoint_dir, rnum, "")
+                        else:
+                            # Local backend retry
+                            for rnum, rimg in retry_batch:
+                                page_text = await _ask_model(rimg, settings.ollama_timeout_seconds)
+                                if not page_text.strip():
+                                    logger.warning(
+                                        "Page %d/%d still empty after retry — marking done, skipping",
+                                        rnum, total_pages,
+                                    )
+                                    checkpoint_manager.save_page(checkpoint_dir, rnum, "")
+                                else:
+                                    pages[rnum - 1] = page_text
+                                    pages_processed += 1
+                                    checkpoint_manager.save_page(checkpoint_dir, rnum, page_text)
+                                    if rnum in failed_pages_metadata:
+                                        del failed_pages_metadata[rnum]
+                            checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
+                        
+                        retry_batch = []
 
             # Mark as completed
             checkpoint_manager.update_progress(checkpoint_dir, total_pages, total_pages, "completed")
-            text = "\n\n".join(pages).strip()
+            non_empty_pages = [p for p in pages if p.strip()]
+            text = "\n\n".join(non_empty_pages).strip()
             if settings.ocr_debug:
                 logger.info(
-                    "OCR finished: file=%s pages=%d chars=%d total=%.2fs",
+                    "OCR finished: file=%s pages=%d (non-empty=%d) chars=%d total=%.2fs",
                     filename,
-                    len(pages),
+                    total_pages,
+                    len(non_empty_pages),
                     len(text),
                     perf_counter() - started_at,
                 )
-            return text, len(pages)
+            return text, len(non_empty_pages)
 
     if suffix in IMAGE_EXTENSIONS:
         page_started_at = perf_counter()
         text = await _transcribe_image(data, settings.ollama_timeout_seconds)
+        if not text.strip():
+            logger.warning("Model returned empty text for image: file=%s", filename)
+        pages_out = 1 if text.strip() else 0
         if settings.ocr_debug:
             duration = perf_counter() - page_started_at
             logger.info("Image page completed: file=%s page=1/1 page_total=%.2fs chars=%d", filename, duration, len(text))
-            logger.info("OCR finished: file=%s pages=1 chars=%d total=%.2fs", filename, len(text), perf_counter() - started_at)
-        return text, 1
+            logger.info("OCR finished: file=%s pages=%d chars=%d total=%.2fs", filename, pages_out, len(text), perf_counter() - started_at)
+        return text, pages_out
 
     raise ValueError(f"Unsupported file type: {suffix or '(no extension)'}.")
 

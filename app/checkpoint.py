@@ -144,3 +144,36 @@ class CheckpointManager:
                 continue
 
         return completed
+
+    def save_failed_pages(self, checkpoint_dir: Path, failed_pages: dict[int, dict]) -> None:
+        """
+        Save failed pages metadata to checkpoint.
+        
+        Args:
+            checkpoint_dir: Checkpoint directory path
+            failed_pages: Dict mapping page_number -> {reason: str, attempts: int, last_tried: str}
+        """
+        failed_file = checkpoint_dir / "failed_pages.json"
+        with open(failed_file, "w", encoding="utf-8") as f:
+            # Convert int keys to strings for JSON
+            json.dump({str(k): v for k, v in failed_pages.items()}, f, indent=2)
+
+    def load_failed_pages(self, checkpoint_dir: Path) -> dict[int, dict]:
+        """
+        Load failed pages metadata from checkpoint.
+        
+        Returns:
+            Dict mapping page_number -> {reason: str, attempts: int, last_tried: str}
+        """
+        failed_file = checkpoint_dir / "failed_pages.json"
+        if not failed_file.exists():
+            return {}
+
+        try:
+            with open(failed_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Convert string keys back to ints
+                return {int(k): v for k, v in data.items()}
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            logger.warning("Failed to read failed_pages.json: %s", exc)
+            return {}
