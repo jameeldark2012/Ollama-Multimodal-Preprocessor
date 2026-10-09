@@ -65,8 +65,13 @@ _TRANSIENT_PATTERNS = (
     "try again",
 )
 
-# How many seconds to wait between retries (index = attempt number 0-based)
-_RETRY_DELAYS = (5.0, 10.0, 20.0)
+# One short same-model retry for transient Gemini overloads. After that, move
+# to the fallback model/local fallback rather than holding an OCR job hostage.
+_RETRY_DELAYS = (5.0,)
+
+
+class GeminiRequestTimeout(TimeoutError):
+    """The synchronous Gemini SDK exceeded the configured per-request limit."""
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -104,8 +109,12 @@ class GeminiOCRBackend:
         self.batch_size = max(1, batch_size)
         self.timeout_seconds = timeout_seconds
         self.max_output_tokens = max_output_tokens
-        # Configure API
-        self.client = genai.Client(api_key=api_key)
+        # Configure a transport-level timeout too. This is the mechanism that
+        # interrupts a stuck HTTP read inside the synchronous Google SDK.
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=max(1, int(timeout_seconds * 1000))),
+        )
 
         # Rate limiter respects both RPM and TPM
         self.rate_limiter = RateLimiter(
@@ -116,10 +125,7 @@ class GeminiOCRBackend:
         # Gemini's SDK is synchronous. Keep its long-lived network waits out
         # of asyncio's shared executor, which is also used for PDF rendering,
         # checkpoint I/O, and video work.
-        self._request_executor = ThreadPoolExecutor(
-            max_workers=min(self.rate_limiter.effective_rpm, 16),
-            thread_name_prefix="gemini-request",
-        )
+        self._request_executor = self._new_request_executor()
 
         self.request_count = 0
 
@@ -132,6 +138,18 @@ class GeminiOCRBackend:
                 tpm_limit,
                 safety_margin * 100,
             )
+
+    def _new_request_executor(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(
+            max_workers=min(self.rate_limiter.effective_rpm, 16),
+            thread_name_prefix="gemini-request",
+        )
+
+    def _replace_stuck_executor(self) -> None:
+        """Quarantine workers whose synchronous SDK call ignored its timeout."""
+        old_executor = self._request_executor
+        self._request_executor = self._new_request_executor()
+        old_executor.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------
     # Public API
@@ -300,13 +318,12 @@ class GeminiOCRBackend:
 
             return per_page_results
 
-        # All models failed - return empty with "error" reason for all pages
-        logger.error(
-            "All Gemini models failed for batch of %d images. Last error: %s",
-            len(batch),
-            last_error,
+        # All Gemini models failed. Raise so OCR can invoke the configured
+        # local fallback only after the complete Gemini chain is exhausted.
+        raise RuntimeError(
+            f"All Gemini models failed for batch of {len(batch)} images. "
+            f"Last error: {last_error}"
         )
-        return [("", "error") for _ in batch]
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -392,9 +409,16 @@ class GeminiOCRBackend:
                 max_output_tokens=self.max_output_tokens,
             ),
         )
-        response = await asyncio.get_running_loop().run_in_executor(
-            self._request_executor, call
-        )
+        future = asyncio.get_running_loop().run_in_executor(self._request_executor, call)
+        try:
+            # Defensive timeout: protects the API request even if a transport
+            # bug causes the SDK's own HTTP timeout to be ignored.
+            response = await asyncio.wait_for(future, timeout=self.timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            self._replace_stuck_executor()
+            raise GeminiRequestTimeout(
+                f"Gemini request exceeded {self.timeout_seconds:.0f}s timeout"
+            ) from exc
 
         # Extract text
         text: str | None = None

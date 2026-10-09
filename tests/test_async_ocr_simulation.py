@@ -13,7 +13,7 @@ import pytest
 from PIL import Image
 
 from app import ocr
-from app.gemini_backend import GeminiOCRBackend
+from app.gemini_backend import GeminiOCRBackend, GeminiRequestTimeout
 from app.rate_limiter import RateLimiter
 
 
@@ -117,6 +117,7 @@ async def test_slow_gemini_transport_does_not_block_the_event_loop():
     backend.client = SimpleNamespace(models=FakeModels())
     backend.max_output_tokens = 100
     backend.request_count = 0
+    backend.timeout_seconds = 30
     image = Image.new("RGB", (1, 1), "white")
     image_buffer = BytesIO()
     image.save(image_buffer, format="JPEG")
@@ -133,3 +134,57 @@ async def test_slow_gemini_transport_does_not_block_the_event_loop():
         assert await request == ["simulated Gemini reply"]
     finally:
         backend._request_executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_stuck_gemini_request_times_out_and_replaces_its_worker_pool():
+    release = Event()
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            assert release.wait(timeout=1)
+            return SimpleNamespace(text="too late")
+
+    backend = object.__new__(GeminiOCRBackend)
+    backend.rate_limiter = RateLimiter(rpm_limit=10, tpm_limit=100_000, safety_margin=1.0)
+    old_executor = ThreadPoolExecutor(max_workers=1)
+    backend._request_executor = old_executor
+    backend.client = SimpleNamespace(models=FakeModels())
+    backend.max_output_tokens = 100
+    backend.request_count = 0
+    backend.timeout_seconds = 0.05
+    image = Image.new("RGB", (1, 1), "white")
+    image_buffer = BytesIO()
+    image.save(image_buffer, format="JPEG")
+
+    try:
+        with pytest.raises(GeminiRequestTimeout, match="exceeded"):
+            await backend._transcribe_with_model("simulation", [image_buffer.getvalue()], 1)
+        assert backend._request_executor is not old_executor
+    finally:
+        release.set()
+        old_executor.shutdown(wait=True)
+        backend._request_executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_all_gemini_models_are_tried_before_local_fallback_can_run(monkeypatch):
+    backend = object.__new__(GeminiOCRBackend)
+    backend.primary_model = "primary"
+    backend.batch_size = 1
+    attempted_models: list[str] = []
+
+    async def always_fail(model_name: str, images: list[bytes], estimated_tokens: int):
+        attempted_models.append(model_name)
+        raise GeminiRequestTimeout("simulated timeout")
+
+    monkeypatch.setattr(backend, "_transcribe_with_model", always_fail)
+    monkeypatch.setattr(backend, "_get_model_fallback_chain", lambda: ["primary", "fallback-a"])
+
+    image = Image.new("RGB", (1, 1), "white")
+    image_buffer = BytesIO()
+    image.save(image_buffer, format="JPEG")
+
+    with pytest.raises(RuntimeError, match="All Gemini models failed"):
+        await backend._transcribe_batch([image_buffer.getvalue()])
+    assert attempted_models == ["primary", "fallback-a"]
