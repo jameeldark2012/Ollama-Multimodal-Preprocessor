@@ -253,6 +253,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
             # Process pages - batch when using Gemini, one-by-one otherwise
             pages_processed = 0
             pending_pages: list[tuple[int, bytes]] = []  # (page_number, image_bytes)
+            gemini_disabled_for_file = False
             failed_pages_metadata: dict[int, dict] = await checkpoint_manager.load_failed_pages(checkpoint_dir)
             
             # Determine batch size
@@ -316,7 +317,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                 if len(pending_pages) >= batch_size or page_number == total_pages:
                     inference_started_at = perf_counter()
                     
-                    if settings.backend == "gemini" and gemini_backend:
+                    if settings.backend == "gemini" and gemini_backend and not gemini_disabled_for_file:
                         # Batch process with Gemini
                         try:
                             images = [img for _, img in pending_pages]
@@ -370,6 +371,14 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
 
                         except Exception as exc:
                             logger.error("Gemini batch processing failed: %s", exc)
+                            from app.gemini_backend import GeminiRecitationError
+
+                            if isinstance(exc, GeminiRecitationError):
+                                gemini_disabled_for_file = True
+                                logger.warning(
+                                    "Gemini RECITATION encountered; disabling Gemini for the rest of file=%s",
+                                    filename,
+                                )
                             # Fall back to local processing if enabled
                             if settings.gemini_fallback_to_local:
                                 logger.info("Falling back to local processing for batch of %d pages", len(pending_pages))
@@ -401,7 +410,11 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                     else:
                         # Process one-by-one with local backend
                         for pnum, img in pending_pages:
-                            page_text = await _ask_model(img, settings.ollama_timeout_seconds)
+                            page_text = await _ask_model(
+                                img,
+                                settings.ollama_timeout_seconds,
+                                force_local=gemini_disabled_for_file,
+                            )
                             if not page_text.strip():
                                 if pnum in failed_pages_metadata:
                                     failed_pages_metadata[pnum]["attempts"] += 1
@@ -466,7 +479,7 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                     
                     if len(retry_batch) >= batch_size or (pnum, img) == pages_to_retry[-1]:
                         # Process retry batch
-                        if settings.backend == "gemini" and gemini_backend:
+                        if settings.backend == "gemini" and gemini_backend and not gemini_disabled_for_file:
                             try:
                                 retry_images = [img for _, img in retry_batch]
                                 retry_results = await gemini_backend.transcribe_batch(retry_images)
@@ -493,6 +506,14 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                                 await checkpoint_manager.save_failed_pages(checkpoint_dir, failed_pages_metadata)
                             except Exception as exc:
                                 logger.error("Gemini retry batch failed: %s", exc)
+                                from app.gemini_backend import GeminiRecitationError
+
+                                if isinstance(exc, GeminiRecitationError):
+                                    gemini_disabled_for_file = True
+                                    logger.warning(
+                                        "Gemini RECITATION encountered; disabling Gemini for the rest of file=%s",
+                                        filename,
+                                    )
                                 if settings.gemini_fallback_to_local:
                                     for rnum, rimg in retry_batch:
                                         page_text = await _ask_model(rimg, settings.ollama_timeout_seconds, force_local=True)
@@ -516,7 +537,11 @@ async def extract_attachment(filename: str, data: bytes) -> tuple[str, int | Non
                         else:
                             # Local backend retry
                             for rnum, rimg in retry_batch:
-                                page_text = await _ask_model(rimg, settings.ollama_timeout_seconds)
+                                page_text = await _ask_model(
+                                    rimg,
+                                    settings.ollama_timeout_seconds,
+                                    force_local=gemini_disabled_for_file,
+                                )
                                 if not page_text.strip():
                                     logger.warning(
                                         "Page %d/%d still empty after retry — marking done, skipping",

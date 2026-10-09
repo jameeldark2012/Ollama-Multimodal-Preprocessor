@@ -136,6 +136,12 @@ GEMINI_FALLBACK_TO_LOCAL=true     # Fall back to Ollama/llama.cpp
    - Fall back to llama.cpp (if `BACKEND` was originally `llamacpp`)
 4. If fallback disabled, raise exception
 
+RECITATION is handled immediately: after the first model returns a
+RECITATION finish reason, no other Gemini models or per-page retries are
+requested. The current batch and all remaining pages in that file go directly
+to the configured local fallback when `GEMINI_FALLBACK_TO_LOCAL=true`. This
+switch is scoped to that file-processing run and does not affect later files.
+
 ## Performance Characteristics
 
 ### Free Tier Optimization

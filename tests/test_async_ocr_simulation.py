@@ -13,7 +13,7 @@ import pytest
 from PIL import Image
 
 from app import ocr
-from app.gemini_backend import GeminiOCRBackend, GeminiRequestTimeout
+from app.gemini_backend import GeminiOCRBackend, GeminiRecitationError, GeminiRequestTimeout
 from app.rate_limiter import RateLimiter
 
 
@@ -75,6 +75,67 @@ async def test_pdf_gemini_flow_is_async_and_uses_only_memory_doubles(monkeypatch
     assert requests == [2]
     assert checkpoint.saved_pages == {1: "simulated page 1", 2: "simulated page 2"}
     assert checkpoint.progress[-1] == (2, 2, "completed")
+
+
+@pytest.mark.asyncio
+async def test_pdf_recitation_switches_entire_file_to_local_only_for_that_run(monkeypatch):
+    document = fitz.open()
+    for _ in range(5):
+        document.new_page()
+    pdf_bytes = document.tobytes()
+    document.close()
+
+    checkpoint = MemoryCheckpointManager()
+    gemini_requests: list[int] = []
+    local_requests: list[bool] = []
+    file_runs = 0
+
+    class SimulatedGemini:
+        batch_size = 2
+
+        async def transcribe_batch(self, images: list[bytes]):
+            nonlocal file_runs
+            gemini_requests.append(len(images))
+            if file_runs == 0 and len(gemini_requests) == 2:
+                raise GeminiRecitationError("simulated RECITATION filter block")
+            return [(f"Gemini page {len(gemini_requests)}-{index + 1}", None) for index in range(len(images))]
+
+    async def simulated_local_ocr(image_bytes: bytes, timeout_seconds: float, force_local: bool = False):
+        local_requests.append(force_local)
+        return f"local page {len(local_requests)}"
+
+    monkeypatch.setattr(ocr, "checkpoint_manager", checkpoint)
+    monkeypatch.setattr(ocr, "gemini_backend", SimulatedGemini())
+    monkeypatch.setattr(ocr, "_ask_model", simulated_local_ocr)
+    monkeypatch.setattr(
+        ocr,
+        "settings",
+        replace(ocr.settings, backend="gemini", gemini_fallback_to_local=True, ocr_debug=False),
+    )
+
+    first_text, first_page_count = await ocr.extract_attachment("recitation.pdf", pdf_bytes)
+    assert first_text == "Gemini page 1-1\n\nGemini page 1-2\n\nlocal page 1\n\nlocal page 2\n\nlocal page 3"
+    assert first_page_count == 5
+    assert gemini_requests == [2, 2]
+    assert local_requests == [True, True, True]
+
+    file_runs += 1
+    second_text, second_page_count = await ocr.extract_attachment("another.pdf", pdf_bytes)
+    assert second_text == (
+        "Gemini page 3-1\n\nGemini page 3-2\n\n"
+        "Gemini page 4-1\n\nGemini page 4-2\n\n"
+        "Gemini page 5-1"
+    )
+    assert second_page_count == 5
+    assert gemini_requests == [2, 2, 2, 2, 1]
+    assert local_requests == [True, True, True]
+    assert checkpoint.saved_pages == {
+        1: "Gemini page 3-1",
+        2: "Gemini page 3-2",
+        3: "Gemini page 4-1",
+        4: "Gemini page 4-2",
+        5: "Gemini page 5-1",
+    }
 
 
 @pytest.mark.asyncio
@@ -188,3 +249,26 @@ async def test_all_gemini_models_are_tried_before_local_fallback_can_run(monkeyp
     with pytest.raises(RuntimeError, match="All Gemini models failed"):
         await backend._transcribe_batch([image_buffer.getvalue()])
     assert attempted_models == ["primary", "fallback-a"]
+
+
+@pytest.mark.asyncio
+async def test_recitation_stops_gemini_model_fallback_immediately(monkeypatch):
+    backend = object.__new__(GeminiOCRBackend)
+    backend.primary_model = "primary"
+    backend.batch_size = 1
+    attempted_models: list[str] = []
+
+    async def recitation(model_name: str, images: list[bytes], estimated_tokens: int):
+        attempted_models.append(model_name)
+        raise RuntimeError("Gemini returned empty response (finish_reason=RECITATION)")
+
+    monkeypatch.setattr(backend, "_transcribe_with_model", recitation)
+    monkeypatch.setattr(backend, "_get_model_fallback_chain", lambda: ["primary", "fallback-a"])
+
+    image = Image.new("RGB", (1, 1), "white")
+    image_buffer = BytesIO()
+    image.save(image_buffer, format="JPEG")
+
+    with pytest.raises(GeminiRecitationError, match="RECITATION"):
+        await backend._transcribe_batch([image_buffer.getvalue()])
+    assert attempted_models == ["primary"]

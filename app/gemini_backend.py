@@ -74,6 +74,10 @@ class GeminiRequestTimeout(TimeoutError):
     """The synchronous Gemini SDK exceeded the configured per-request limit."""
 
 
+class GeminiRecitationError(RuntimeError):
+    """Gemini blocked the OCR response because of its RECITATION filter."""
+
+
 def _is_transient(exc: Exception) -> bool:
     """Return True if the exception looks like a transient / server-side error."""
     msg = str(exc).lower()
@@ -193,8 +197,8 @@ class GeminiOCRBackend:
 
         Falls back through model list on failure.  Transient errors are
         retried on the same model with exponential back-off before trying
-        the next model.  RECITATION errors on a full batch trigger a
-        per-page single-image retry.
+        the next model. RECITATION errors are raised immediately so the
+        caller can use the local backend without spending more Gemini requests.
 
         Args:
             images: List of JPEG image bytes
@@ -226,8 +230,6 @@ class GeminiOCRBackend:
                 total_tokens += estimate_image_tokens(width, height)
 
         last_error: Exception | None = None
-        recitation_count = 0
-
         for model_name in self._get_model_fallback_chain():
             # --- retry loop for transient errors on the same model ---
             for attempt in range(len(_RETRY_DELAYS) + 1):
@@ -239,16 +241,16 @@ class GeminiOCRBackend:
                     last_error = exc
 
                     if _is_recitation(exc):
-                        recitation_count += 1
                         logger.warning(
-                            "Gemini model %s failed for batch of %d images: %s",
+                            "Gemini model %s hit RECITATION for batch of %d images; "
+                            "stopping Gemini attempts so the caller can use local fallback: %s",
                             model_name,
                             len(batch),
                             exc,
                         )
-                        # No point retrying same model; RECITATION is
-                        # deterministic for a given (model, input) pair.
-                        break
+                        raise GeminiRecitationError(
+                            f"Gemini RECITATION filter blocked batch of {len(batch)} images"
+                        ) from exc
 
                     if _is_transient(exc) and attempt < len(_RETRY_DELAYS):
                         delay = _RETRY_DELAYS[attempt]
@@ -272,51 +274,6 @@ class GeminiOCRBackend:
                         exc,
                     )
                     break
-
-        # --- If every model raised RECITATION for a multi-page batch,
-        #     retry page-by-page as single-image requests ---
-        if recitation_count >= len(self._get_model_fallback_chain()) and len(batch) > 1:
-            logger.warning(
-                "All models hit RECITATION for batch of %d — retrying one page at a time",
-                len(batch),
-            )
-            per_page_results: list[tuple[str, str | None]] = []
-            for idx, img_bytes in enumerate(batch):
-                page_token_est = (
-                    estimate_text_tokens(SYSTEM_PROMPT)
-                    + estimate_text_tokens("Copy the text from this image.")
-                    + estimate_image_tokens(*Image.open(BytesIO(img_bytes)).size)
-                )
-                page_result = ""
-                page_reason: str | None = "recitation"  # Assume recitation until proven otherwise
-                
-                for model_name in self._get_model_fallback_chain():
-                    try:
-                        results = await self._transcribe_with_model(
-                            model_name, [img_bytes], page_token_est
-                        )
-                        page_result = results[0] if results else ""
-                        if page_result.strip():
-                            page_reason = None  # Success!
-                            break
-                        else:
-                            page_reason = "empty"  # Model returned empty, not RECITATION
-                    except Exception as exc2:
-                        if _is_recitation(exc2):
-                            page_reason = "recitation"
-                        else:
-                            page_reason = "error"
-                        logger.warning(
-                            "Per-page retry page %d/%d model %s failed: %s",
-                            idx + 1,
-                            len(batch),
-                            model_name,
-                            exc2,
-                        )
-                
-                per_page_results.append((page_result, page_reason))
-
-            return per_page_results
 
         # All Gemini models failed. Raise so OCR can invoke the configured
         # local fallback only after the complete Gemini chain is exhausted.
