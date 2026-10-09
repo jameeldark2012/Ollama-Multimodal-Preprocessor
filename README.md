@@ -1,6 +1,6 @@
-# Ollama OCR backend
+# llm-file-parser
 
-A small FastAPI service that sends scanned PDF pages and images to a local Ollama vision model, and exposes an OpenAI-compatible chat endpoint for Open WebUI. Text-like files (`txt`, `md`, `csv`, `json`, `html`, `xml`, `yaml`) are returned as decoded text without changing their contents.
+A small FastAPI service that sends scanned PDF pages and images to a local / gemini  model, and exposes an OpenAI-compatible chat endpoint for Open WebUI. Text-like files (`txt`, `md`, `csv`, `json`, `html`, `xml`, `yaml`) are returned as decoded text without changing their contents.
 
 ## Start
 
